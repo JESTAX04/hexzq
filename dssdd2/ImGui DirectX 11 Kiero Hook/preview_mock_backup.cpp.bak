@@ -1,0 +1,3599 @@
+#include <windows.h>
+#include <d3d11.h>
+#include <tchar.h>
+#include <vector>
+#include <string>
+#include <dwmapi.h>
+#include <cmath>
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+
+#include "imgui/imgui.h"
+#include "imgui/imgui_impl_win32.h"
+#include "imgui/imgui_impl_dx11.h"
+#include "TextEditor.hpp"
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_SUPPORT_GIF
+#include "stb_image.h"
+#include "icons/icon.h"
+#include "icons/font.h"
+#include "icons/font_awesome.h"
+#include "icons/font_awesome.cpp"
+
+// Forward declarations
+static ID3D11Device*            g_pd3dDevice = nullptr;
+static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
+static IDXGISwapChain*          g_pSwapChain = nullptr;
+static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+
+bool CreateDeviceD3D(HWND hWnd);
+void CleanupDeviceD3D();
+void CreateRenderTarget();
+void CleanupRenderTarget();
+LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// Global UI State
+static bool guiVisible = true;
+static TextEditor editor;
+static std::vector<ID3D11ShaderResourceView*> logoFrames;
+static int logoFrameCount = 0;
+static int* logoDelays = nullptr;
+static float logoAnimTime = 0.0f;
+static int currentLogoFrame = 0;
+static float buttonClickTime[8] = { -999.0f, -999.0f, -999.0f, -999.0f, -999.0f, -999.0f, -999.0f, -999.0f };
+
+// Fonts
+static ImFont* g_fontMain = nullptr;
+static ImFont* g_fontSidebarIcons = nullptr;
+static ImFont* g_fontSmall = nullptr;
+
+// ── Extreme-Left Dock Modes (World / Resources / Docs) ──
+enum DockMode {
+	DOCK_ONLINE = 0,    // 🌐 Globe (Online Menu from screenshot 2)
+	DOCK_RESOURCES = 1, // 📁 Folder (Resource Dumper & Lua Executor)
+	DOCK_DOCS = 2       // 📚 Books (Documentation)
+};
+static int g_dockMode = DOCK_RESOURCES; // Default: land straight on the Lua Executor tab
+
+// ── Inside-Window Navigation Tabs (Screenshot 1) ──
+enum AppTab {
+	TAB_EXECUTOR = 0,   // ICON_FA_CODE
+	TAB_RESOURCES = 1,  // ICON_FA_FOLDER
+	TAB_SERVER = 2,     // ICON_FA_SERVER
+	TAB_DOCS = 3,       // ICON_FA_BOOK
+	TAB_COMBAT = 4,     // ICON_FA_CROSSHAIRS
+	TAB_VISUALS = 5,    // ICON_FA_EYE
+	TAB_TOOLS = 6,      // ICON_FA_BRIEFCASE
+	TAB_SETTINGS = 7    // ICON_FA_COG
+};
+static int g_currentTab = TAB_EXECUTOR;
+static int g_selectedResource = -1;
+static char g_searchFilter[128] = "";
+static bool g_consoleOpen = true;
+
+// Dynamic resource list (clean, no fake resources)
+static std::vector<std::string> g_resourceList;
+
+// ── Online Menu Categories ──
+enum OnlineCategory {
+	ONLINE_PLAYERS = 0,  // ICON_FA_USERS (👥 Player List & Trolling)
+	ONLINE_COMBAT = 1,   // ICON_FA_CROSSHAIRS (🎯 Combat & Weapons)
+	ONLINE_VISUALS = 2,  // ICON_FA_EYE (👁️ Visuals & ESP)
+	ONLINE_WORLD = 3,    // ICON_FA_GLOBE (🌐 World) - Placed directly under Visuals!
+	ONLINE_SELF = 4,     // ICON_FA_SHIELD_ALT (🛡️ Self)
+	ONLINE_VEHICLES = 5, // ICON_FA_CAR (🚗 Vehicles)
+	ONLINE_CONFIGS = 6   // ICON_FA_SLIDERS_H (💾 Config Profiles)
+};
+static int g_onlineCategory = ONLINE_PLAYERS; // Default to Player List!
+
+struct FeatureCard {
+	int category;
+	const char* title;
+	const char* desc;
+	bool enabled;
+	bool bookmarked;
+};
+static FeatureCard g_onlineCards[] = {
+	// Combat (ONLINE_COMBAT) - Right after Players!
+	{ ONLINE_COMBAT, "Aim Assist", "Smooth crosshair target assist", true, true },
+	{ ONLINE_COMBAT, "Silent Aim", "Silent projectile vector redirection", true, true },
+	{ ONLINE_COMBAT, "Trigger Bot", "Automatic fire on crosshair lock", false, true },
+	{ ONLINE_COMBAT, "Give All Weapons", "Equip complete arsenal with max ammo", false, true },
+	{ ONLINE_COMBAT, "Infinite Ammo", "Bottomless magazine & no reload", true, true },
+	{ ONLINE_COMBAT, "Rapid Fire", "Max rate of fire for all weapons", false, false },
+	{ ONLINE_COMBAT, "No Recoil & Spread", "Perfect accuracy bullet trajectory", true, true },
+	{ ONLINE_COMBAT, "Explosive Ammo", "Add impact shockwave to projectiles", false, false },
+
+	// World (ONLINE_WORLD)
+	{ ONLINE_WORLD, "Teleport Map", "Instant waypoint coordinates sync", false, true },
+	{ ONLINE_WORLD, "Free Camera", "Detached 3D spectate & cinematic camera", false, true },
+	{ ONLINE_WORLD, "Weather Override", "Custom atmospheric weather state", false, false },
+	{ ONLINE_WORLD, "Time Cycle", "Freeze or shift world clock time", false, false },
+	{ ONLINE_WORLD, "Clear Area", "Delete nearby peds, vehicles & objects", false, false },
+	{ ONLINE_WORLD, "Custom IPLs", "Load interiors & map modifications", false, false },
+	{ ONLINE_WORLD, "Gravity Shift", "Modify global physics gravity vector", false, false },
+	{ ONLINE_WORLD, "Object Spawner", "Spawn props and map entities", false, true },
+	{ ONLINE_WORLD, "Blackout Mode", "Turn off all world electricity & lights", false, false },
+
+	// Self (ONLINE_SELF)
+	{ ONLINE_SELF, "God Mode", "Invincible ped health & armor", true, true },
+	{ ONLINE_SELF, "Semi-God Mode", "Auto heal before fatal damage threshold", false, false },
+	{ ONLINE_SELF, "Infinite Stamina", "Sprint & swim without fatigue", true, true },
+	{ ONLINE_SELF, "Noclip & Fly", "Ghost collision world traversal", false, true },
+	{ ONLINE_SELF, "Invisibility", "Render ped model fully transparent", false, false },
+	{ ONLINE_SELF, "Super Jump", "Enhanced leap altitude multiplier", false, false },
+	{ ONLINE_SELF, "Never Wanted", "Bypass police search & heat levels", true, true },
+	{ ONLINE_SELF, "Clean Ped", "Remove blood, dirt, and bullet wounds", false, false },
+
+	// Vehicles (ONLINE_VEHICLES)
+	{ ONLINE_VEHICLES, "Vehicle List", "Nearby vehicles & spawner engine", false, true },
+	{ ONLINE_VEHICLES, "Spawn Vehicle", "Instant customized vehicle delivery", false, true },
+	{ ONLINE_VEHICLES, "Repair Engine", "Restore engine health and visual damage", false, true },
+	{ ONLINE_VEHICLES, "Vehicle Godmode", "Invulnerable chassis and tires", true, true },
+	{ ONLINE_VEHICLES, "Speed Boost Multiplier", "Press Shift for torque & speed surge", true, true },
+	{ ONLINE_VEHICLES, "Drift Mode", "Lower tire friction for easy drifting", false, false },
+	{ ONLINE_VEHICLES, "Auto Flip", "Automatically right overturned vehicles", true, false },
+	{ ONLINE_VEHICLES, "Rainbow Color", "Smooth RGB cycle on primary vehicle paint", false, false }
+};
+static const int g_onlineCardCount = sizeof(g_onlineCards) / sizeof(g_onlineCards[0]);
+
+// ── Online Menu: Players & Trolling Options ──
+struct OnlinePlayer {
+	int id;
+	const char* name;
+	int ping;
+	float health;       // 0 to 100
+	float armor;        // 0 to 100
+	float distance;     // in meters
+	const char* vehicle;// "On Foot", "Pegassi Zentorno", etc.
+	const char* zone;   // "Legion Square", "Sandy Shores", etc.
+	bool isGodmode;
+	bool isStaff;
+	bool isDead;
+};
+
+static OnlinePlayer g_onlinePlayers[] = {
+	{ 1,   "Matrix_Gamer",   24, 100.0f, 100.0f,  45.0f, "Pegassi Zentorno", "Legion Square",    false, false, false },
+	{ 4,   "Kavinda_SL",     32, 100.0f,  50.0f, 120.0f, "Karin Sultan RS",  "Vinewood Hills",   false, false, false },
+	{ 7,   "Alex_Rider",     18,  85.0f,   0.0f, 310.0f, "On Foot",          "Del Perro Pier",   false, false, false },
+	{ 12,  "GhostRacer99",   45, 100.0f,  75.0f, 540.0f, "Pfister Comet S2", "Rockford Hills",   false, false, false },
+	{ 18,  "Shadow_FiveM",   60,  40.0f,   0.0f, 890.0f, "On Foot",          "Davis / Grove St", false, false, false },
+	{ 23,  "Viper_007",      28, 100.0f, 100.0f, 1250.0f,"Annis Elegy Retro", "Sandy Shores",     false, false, false },
+	{ 31,  "DarkKnight",     85, 100.0f,  25.0f, 1600.0f,"On Foot",          "Mission Row PD",   false, true,  false },
+	{ 42,  "CyberSamurai",   38, 100.0f, 100.0f, 2100.0f,"Overflod Entity",  "Paleto Bay",       false, false, false },
+	{ 55,  "NeonBlade",      52,  65.0f,   0.0f, 2800.0f,"Dinka Jester RR",  "Mirror Park",      false, false, false },
+	{ 64,  "RedWolf_RP",     22,   0.0f,   0.0f,  95.0f, "Wasted",           "Pillbox Hospital", false, false, true  },
+	{ 77,  "ApexPredator",   74, 100.0f,  50.0f, 3400.0f,"Western Reever",   "Chumash Coast",    false, false, false },
+	{ 88,  "FrostByte",      35, 100.0f, 100.0f, 4100.0f,"On Foot",          "Mount Chiliad",    true,  false, false },
+	{ 99,  "PhantomX_Dev",   15, 100.0f, 100.0f, 180.0f, "Grotti Turismo",   "Downtown LS",      false, true,  false },
+	{ 102, "SavageGamer",    95,  90.0f,   0.0f, 2450.0f,"Bravado Gauntlet", "Cypress Flats",    false, false, false }
+};
+static const int g_playerCount = sizeof(g_onlinePlayers) / sizeof(g_onlinePlayers[0]);
+static int g_selectedPlayerIdx = 1; // Default to Kavinda_SL (#4)
+static char g_playerSearch[64] = "";
+static char g_trollStatusMsg[128] = "Select any trolling action to dispatch to target player";
+static float g_trollStatusTime = 0.0f;
+static bool g_trollStatusSuccess = true;
+
+struct TrollAction {
+	const char* icon;
+	const char* title;
+	const char* desc;
+	ImU32 iconColor;
+};
+
+static TrollAction g_trollActions[] = {
+	{ ICON_FA_SNOWFLAKE, "Freeze Ped",        "Lock target player in place permanently", IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_ROCKET,    "Launch Sky",        "Shoot target 500m into the stratosphere", IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_BOMB,      "Fake Explosion",    "Spawn loud harmless explosion & cam shake",IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_CAR,       "Ram With Truck",    "Spawn high-speed Phantom ramming into ped",IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_LOCK,      "Spawn Cage",        "Trap player inside an indestructible cage", IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_BOLT,      "Taser Loop",        "Endless electric taser ragdoll shock",    IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_TINT,      "Water Geyser",      "Continuous high pressure fire hydrant blast",IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_FIRE,      "Burn Player",       "Ignite fire particle effects on target ped",IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_BAN,       "Disarm Inventory",  "Force target to drop all held weapons & ammo",IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_SKULL,     "Silent Kill",       "Discreetly trigger fatal lethal health event",IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_SYNC,      "Infinite Ragdoll",  "Disable stance physics and force stumble", IM_COL32(240, 240, 250, 255) },
+	{ ICON_FA_USERS,     "Hostile Clones",    "Spawn 5 hostile clone peds armed with bats",IM_COL32(240, 240, 250, 255) }
+};
+static const int g_trollActionCount = sizeof(g_trollActions) / sizeof(g_trollActions[0]);
+
+ImVec4 LerpColor(ImVec4 a, ImVec4 b, float t)
+{
+	return ImVec4(
+		a.x + (b.x - a.x) * t,
+		a.y + (b.y - a.y) * t,
+		a.z + (b.z - a.z) * t,
+		a.w + (b.w - a.w) * t
+	);
+}
+
+bool AnimatedButton(const char* label, ImVec2 size, int buttonIndex)
+{
+	float currentTime = (float)ImGui::GetTime();
+	float timeSinceClick = currentTime - buttonClickTime[buttonIndex];
+	float animDuration = 0.3f;
+
+	ImVec4 normalColor = ImVec4(16 / 255.0f, 16 / 255.0f, 20 / 255.0f, 1.0f);
+	ImVec4 clickColor = ImVec4(245 / 255.0f, 245 / 255.0f, 250 / 255.0f, 1.0f);
+
+	ImVec4 currentColor = normalColor;
+	if (timeSinceClick < animDuration)
+	{
+		float t = 1.0f - (timeSinceClick / animDuration);
+		currentColor = LerpColor(normalColor, clickColor, t);
+	}
+
+	ImGui::PushStyleColor(ImGuiCol_Button, currentColor);
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(30 / 255.0f, 30 / 255.0f, 36 / 255.0f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, clickColor);
+
+	bool clicked = ImGui::Button(label, size);
+
+	ImGui::PopStyleColor(3);
+
+	if (clicked)
+	{
+		buttonClickTime[buttonIndex] = currentTime;
+	}
+
+	return clicked;
+}
+
+// ── Combat UI State & Helper Widgets (Matching Eulen Style) ──
+static int g_combatPreset = 0;
+static bool g_aimbotEnabled = true;
+static bool g_aimbotMagicBullet = false;
+static int g_aimbotFov = 125;
+static bool g_aimbotDrawFov = true;
+static int g_aimbotSmoothness = 0;
+static int g_aimbotDistance = 180;
+static int g_aimbotMinHealth = 0;
+static int g_aimbotTargetBone = 0;
+static int g_aimbotPriority = 0;
+
+static bool g_silentAimEnabled = true;
+static bool g_silentAimMagicBullet = false;
+static int g_silentAimFov = 120;
+static bool g_silentAimDrawFov = true;
+static int g_silentAimMissChance = 0;
+static float g_silentAimDistance = 300.0f;
+static bool g_silentAimWeaponRange = false;
+static int g_silentAimTargetBone = 0;
+static bool g_silentAimTargetNPCs = false;
+static bool g_silentAimPrioritizeDriver = true;
+
+static bool g_triggerbotEnabled = false;
+static int g_triggerbotMode = 0;
+static int g_triggerbotDelay = 25;
+
+// ── Visuals & ESP State ──
+static bool g_espEnabled = true;
+static int g_espBoxType = 1; // 0=None, 1=2D Box, 2=Corner Box, 3=3D Box
+static bool g_espSkeleton = true;
+static bool g_espSnaplines = false;
+static int g_espSnaplinePos = 2; // 0=Top, 1=Crosshair, 2=Bottom
+static bool g_espPlayerName = true;
+static bool g_espHealthBar = true;
+static int g_espHealthStyle = 0; // 0=Left Bar, 1=Right Bar, 2=Top Bar
+static bool g_espArmorBar = true;
+static bool g_espWeapon = true;
+static bool g_espDistance = true;
+static int g_espMaxDistance = 450; // meters
+static bool g_espIgnoreTeam = true;
+static bool g_espVisibleOnly = false;
+
+// Chams & World
+static bool g_chamsEnabled = true;
+static int g_chamsMaterial = 1; // 0=Flat Solid, 1=Textured Glow, 2=Wireframe, 3=Metallic Glass
+static bool g_chamsThroughWalls = true;
+static bool g_espVehicles = false;
+static bool g_espDroppedItems = true;
+static bool g_espNpc = false;
+static bool g_espRadar = true;
+static bool g_espCrosshair = true;
+static int g_crosshairStyle = 0; // 0=Classic Dot, 1=Tactical Cross, 2=Circle
+
+// 3D Canvas Preview Interactive State
+static float g_previewYaw = 0.45f;
+static float g_previewScale = 1.0f;
+static bool g_previewAutoRotate = true;
+
+// Colors for ESP
+static float g_espBoxColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+static float g_espSkelColor[4] = { 0.9f, 0.92f, 1.0f, 1.0f };
+static float g_espSnapColor[4] = { 1.0f, 1.0f, 1.0f, 0.7f };
+static float g_chamsVisColor[4] = { 0.2f, 0.8f, 1.0f, 1.0f };
+static float g_chamsInvisColor[4] = { 1.0f, 0.2f, 0.4f, 1.0f };
+
+// ── Config Manager State ──
+struct ConfigProfile {
+	char name[64];
+	char author[64];
+	char date[32];
+	int featureCount;
+	bool isCloud;
+};
+static std::vector<ConfigProfile> g_configProfiles = {
+	{ "legit_smooth_v2.cfg", "redENGINE", "2026-09-24", 18, false },
+	{ "rage_fivem_hvh.cfg",  "Prodigy",   "2026-09-22", 34, false },
+	{ "semi_closet_aim.cfg", "GhostUser", "2026-09-20", 22, false },
+	{ "tournament_esp.cfg",  "EsportsPro","2026-09-18", 12, true },
+	{ "fivem_drift_god.cfg", "TunerBoy",  "2026-09-15", 15, true }
+};
+static int g_selectedConfigIdx = 0;
+static char g_configSearch[64] = "";
+static char g_newConfigName[64] = "my_custom_setup.cfg";
+static char g_configStatusMsg[128] = "Config system ready. Select a profile to load.";
+static float g_configStatusTime = 0.0f;
+
+// ── Gear Popup & Keybind State ──
+struct GearPopupState {
+	bool isOpen = false;
+	char featureName[64] = "";
+	int keyIdx = 1;     // e.g. 1 = [ LALT ]
+	int bindMode = 0;   // 0 = Hold, 1 = Toggle, 2 = Always
+	float color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+};
+static GearPopupState g_gearPopup;
+
+static const char* g_keybindList[] = {
+	"[ None ]", "[ LALT ]", "[ LSHIFT ]", "[ RBUTTON ]", "[ MOUSE4 ]", "[ MOUSE5 ]", "[ CAPS ]", "[ X ]", "[ C ]", "[ V ]", "[ E ]", "[ F ]"
+};
+
+static bool ToggleSwitch(const char* str_id, bool* v)
+{
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+	float width = 36.0f;
+	float height = 18.0f;
+	float radius = height * 0.5f;
+
+	ImGui::InvisibleButton(str_id, ImVec2(width, height));
+	if (ImGui::IsItemClicked())
+		*v = !(*v);
+
+	bool isHovered = ImGui::IsItemHovered();
+
+	// Smooth 2026 luxury colors
+	ImU32 col_bg = *v ? IM_COL32(245, 248, 255, 255) :
+		(isHovered ? IM_COL32(32, 35, 46, 255) : IM_COL32(20, 22, 30, 255));
+	ImU32 col_border = *v ? IM_COL32(255, 255, 255, 255) :
+		(isHovered ? IM_COL32(58, 64, 84, 255) : IM_COL32(38, 42, 56, 255));
+	ImU32 col_circle = *v ? IM_COL32(11, 12, 16, 255) :
+		(isHovered ? IM_COL32(200, 205, 220, 255) : IM_COL32(130, 135, 150, 255));
+
+	// Track with smooth rounded border
+	draw_list->AddRectFilled(p, ImVec2(p.x + width, p.y + height), col_bg, radius);
+	draw_list->AddRect(p, ImVec2(p.x + width, p.y + height), col_border, radius, 15, 1.0f);
+
+	// Circular Knob
+	float circle_x = *v ? (p.x + width - radius) : (p.x + radius);
+	draw_list->AddCircleFilled(ImVec2(circle_x, p.y + radius), radius - 2.5f, col_circle);
+
+	return *v;
+}
+
+static bool CustomSliderInt(const char* label, const char* str_id, int* v, int v_min, int v_max, const char* unit = "")
+{
+	ImDrawList* draw = ImGui::GetWindowDrawList();
+	float availW = ImGui::GetContentRegionAvail().x;
+
+	// 1. Label and Value row
+	ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "%s", label);
+
+	char valBuf[32];
+	if (unit && unit[0] != '\0')
+		sprintf_s(valBuf, "%d%s", *v, unit);
+	else
+		sprintf_s(valBuf, "%d", *v);
+
+	ImVec2 valSz = ImGui::CalcTextSize(valBuf);
+	float badgePadX = 6.0f;
+	float badgeW = valSz.x + badgePadX * 2.0f;
+	float badgeH = valSz.y + 4.0f;
+	ImVec2 curPos = ImGui::GetCursorScreenPos();
+	float badgeX = curPos.x + availW - badgeW;
+	float badgeY = curPos.y - ImGui::GetTextLineHeightWithSpacing() + 2.0f;
+
+	// Value Badge Pill
+	draw->AddRectFilled(ImVec2(badgeX, badgeY), ImVec2(badgeX + badgeW, badgeY + badgeH), IM_COL32(20, 22, 30, 255), 4.0f);
+	draw->AddRect(ImVec2(badgeX, badgeY), ImVec2(badgeX + badgeW, badgeY + badgeH), IM_COL32(40, 44, 58, 255), 4.0f);
+	draw->AddText(ImVec2(badgeX + badgePadX, badgeY + 2.0f), IM_COL32(245, 248, 255, 255), valBuf);
+
+	// 2. Custom Sleek Track Slider (2026 Luxury Eulen Style)
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	float sliderH = 14.0f; // Clickable hit area
+	float trackH = 4.0f;   // Visual track line
+
+	ImGui::InvisibleButton(str_id, ImVec2(availW, sliderH));
+	bool isHovered = ImGui::IsItemHovered();
+	bool isActive = ImGui::IsItemActive();
+
+	float trackY = p.y + (sliderH - trackH) * 0.5f;
+
+	if (isActive || (isHovered && ImGui::IsMouseDown(0)))
+	{
+		float mouseX = ImGui::GetIO().MousePos.x;
+		float t = (mouseX - p.x) / availW;
+		if (t < 0.0f) t = 0.0f;
+		if (t > 1.0f) t = 1.0f;
+		*v = v_min + (int)(t * (v_max - v_min) + 0.5f);
+	}
+
+	float fraction = (float)(*v - v_min) / (float)(v_max - v_min);
+	if (fraction < 0.0f) fraction = 0.0f;
+	if (fraction > 1.0f) fraction = 1.0f;
+
+	// Background track line
+	draw->AddRectFilled(
+		ImVec2(p.x, trackY),
+		ImVec2(p.x + availW, trackY + trackH),
+		IM_COL32(26, 28, 38, 255),
+		trackH * 0.5f
+	);
+
+	// Active filled track line
+	float grabX = p.x + fraction * availW;
+	if (fraction > 0.005f)
+	{
+		draw->AddRectFilled(
+			ImVec2(p.x, trackY),
+			ImVec2(grabX, trackY + trackH),
+			isActive ? IM_COL32(255, 255, 255, 255) : IM_COL32(225, 230, 245, 255),
+			trackH * 0.5f
+		);
+	}
+
+	// Interactive Grab Knob
+	float knobRadius = isActive ? 6.8f : (isHovered ? 6.2f : 5.5f);
+	if (isActive || isHovered)
+	{
+		draw->AddCircle(
+			ImVec2(grabX, p.y + sliderH * 0.5f),
+			knobRadius + 2.5f,
+			IM_COL32(255, 255, 255, 40),
+			16,
+			1.5f
+		);
+	}
+	draw->AddCircleFilled(
+		ImVec2(grabX, p.y + sliderH * 0.5f),
+		knobRadius,
+		IM_COL32(255, 255, 255, 255)
+	);
+	draw->AddCircle(
+		ImVec2(grabX, p.y + sliderH * 0.5f),
+		knobRadius,
+		IM_COL32(16, 17, 22, 200),
+		16,
+		1.0f
+	);
+
+	ImGui::Spacing();
+	return isActive;
+}
+
+static bool CustomSliderFloat(const char* label, const char* str_id, float* v, float v_min, float v_max, const char* unit = "")
+{
+	ImDrawList* draw = ImGui::GetWindowDrawList();
+	float availW = ImGui::GetContentRegionAvail().x;
+
+	ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "%s", label);
+
+	char valBuf[32];
+	if (unit && unit[0] != '\0')
+		sprintf_s(valBuf, "%.1f%s", *v, unit);
+	else
+		sprintf_s(valBuf, "%.1f", *v);
+
+	ImVec2 valSz = ImGui::CalcTextSize(valBuf);
+	float badgePadX = 6.0f;
+	float badgeW = valSz.x + badgePadX * 2.0f;
+	float badgeH = valSz.y + 4.0f;
+	ImVec2 curPos = ImGui::GetCursorScreenPos();
+	float badgeX = curPos.x + availW - badgeW;
+	float badgeY = curPos.y - ImGui::GetTextLineHeightWithSpacing() + 2.0f;
+
+	// Value Badge Pill
+	draw->AddRectFilled(ImVec2(badgeX, badgeY), ImVec2(badgeX + badgeW, badgeY + badgeH), IM_COL32(20, 22, 30, 255), 4.0f);
+	draw->AddRect(ImVec2(badgeX, badgeY), ImVec2(badgeX + badgeW, badgeY + badgeH), IM_COL32(40, 44, 58, 255), 4.0f);
+	draw->AddText(ImVec2(badgeX + badgePadX, badgeY + 2.0f), IM_COL32(245, 248, 255, 255), valBuf);
+
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	float sliderH = 14.0f;
+	float trackH = 4.0f;
+
+	ImGui::InvisibleButton(str_id, ImVec2(availW, sliderH));
+	bool isHovered = ImGui::IsItemHovered();
+	bool isActive = ImGui::IsItemActive();
+
+	float trackY = p.y + (sliderH - trackH) * 0.5f;
+
+	if (isActive || (isHovered && ImGui::IsMouseDown(0)))
+	{
+		float mouseX = ImGui::GetIO().MousePos.x;
+		float t = (mouseX - p.x) / availW;
+		if (t < 0.0f) t = 0.0f;
+		if (t > 1.0f) t = 1.0f;
+		*v = v_min + t * (v_max - v_min);
+	}
+
+	float fraction = (*v - v_min) / (v_max - v_min);
+	if (fraction < 0.0f) fraction = 0.0f;
+	if (fraction > 1.0f) fraction = 1.0f;
+
+	draw->AddRectFilled(
+		ImVec2(p.x, trackY),
+		ImVec2(p.x + availW, trackY + trackH),
+		IM_COL32(26, 28, 38, 255),
+		trackH * 0.5f
+	);
+
+	float grabX = p.x + fraction * availW;
+	if (fraction > 0.005f)
+	{
+		draw->AddRectFilled(
+			ImVec2(p.x, trackY),
+			ImVec2(grabX, trackY + trackH),
+			isActive ? IM_COL32(255, 255, 255, 255) : IM_COL32(225, 230, 245, 255),
+			trackH * 0.5f
+		);
+	}
+
+	float knobRadius = isActive ? 6.8f : (isHovered ? 6.2f : 5.5f);
+	if (isActive || isHovered)
+	{
+		draw->AddCircle(
+			ImVec2(grabX, p.y + sliderH * 0.5f),
+			knobRadius + 2.5f,
+			IM_COL32(255, 255, 255, 40),
+			16,
+			1.5f
+		);
+	}
+	draw->AddCircleFilled(
+		ImVec2(grabX, p.y + sliderH * 0.5f),
+		knobRadius,
+		IM_COL32(255, 255, 255, 255)
+	);
+	draw->AddCircle(
+		ImVec2(grabX, p.y + sliderH * 0.5f),
+		knobRadius,
+		IM_COL32(16, 17, 22, 200),
+		16,
+		1.0f
+	);
+
+	ImGui::Spacing();
+	return isActive;
+}
+
+static void CustomCombo(const char* label, const char* str_id, int* current_item, const char* const items[], int items_count)
+{
+	ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "%s", label);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 6.0f));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(18, 20, 28, 255));
+	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(26, 29, 40, 255));
+	ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(34, 38, 52, 255));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(36, 40, 56, 255));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(245, 248, 255, 255));
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, IM_COL32(14, 15, 21, 252));
+	ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(30, 34, 48, 255));
+	ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(44, 50, 70, 255));
+	ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(56, 64, 88, 255));
+
+	ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+	ImGui::Combo(str_id, current_item, items, items_count);
+
+	ImGui::PopStyleColor(9);
+	ImGui::PopStyleVar(2);
+	ImGui::Spacing();
+}
+
+static void ToggleRow(const char* label, const char* str_id, bool* v, bool hasGear = false, bool hasColorDot = false, ImU32 dotColor = IM_COL32(255, 255, 255, 255))
+{
+	float availW = ImGui::GetContentRegionAvail().x;
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "%s", label);
+
+	float rightWidgetsWidth = 38.0f;
+	if (hasGear) rightWidgetsWidth += 26.0f;
+	if (hasColorDot) rightWidgetsWidth += 24.0f;
+
+	ImGui::SameLine(availW - rightWidgetsWidth + 8.0f);
+
+	if (hasColorDot)
+	{
+		ImVec2 p = ImGui::GetCursorScreenPos();
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		dl->AddCircleFilled(ImVec2(p.x + 8.0f, p.y + 9.0f), 5.5f, dotColor);
+		dl->AddCircle(ImVec2(p.x + 8.0f, p.y + 9.0f), 5.5f, IM_COL32(60, 65, 80, 255), 16, 1.0f);
+		ImGui::PushID(str_id);
+		if (ImGui::InvisibleButton("##dotbtn", ImVec2(18.0f, 18.0f)))
+		{
+			g_gearPopup.isOpen = true;
+			strcpy_s(g_gearPopup.featureName, label);
+		}
+		ImGui::PopID();
+		ImGui::SameLine();
+	}
+
+	if (hasGear)
+	{
+		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 145, 165, 255));
+		char gearId[32];
+		sprintf_s(gearId, "%s##gear_%s", ICON_FA_COG, str_id);
+		if (ImGui::SmallButton(gearId))
+		{
+			g_gearPopup.isOpen = true;
+			strcpy_s(g_gearPopup.featureName, label);
+		}
+		ImGui::PopStyleColor();
+		ImGui::SameLine();
+	}
+
+	ToggleSwitch(str_id, v);
+	ImGui::Spacing();
+}
+
+static void ModernSectionHeader(const char* title, const char* icon = nullptr)
+{
+	ImDrawList* draw = ImGui::GetWindowDrawList();
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	float availW = ImGui::GetContentRegionAvail().x;
+
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(165, 170, 190, 255));
+	if (icon && icon[0] != '\0')
+		ImGui::Text("%s  %s", icon, title);
+	else
+		ImGui::TextUnformatted(title);
+	ImGui::PopStyleColor();
+
+	float lineY = p.y + ImGui::GetTextLineHeightWithSpacing() - 2.0f;
+	draw->AddLine(ImVec2(p.x, lineY), ImVec2(p.x + availW, lineY), IM_COL32(32, 35, 46, 255), 1.0f);
+	draw->AddLine(ImVec2(p.x, lineY), ImVec2(p.x + 40.0f, lineY), IM_COL32(240, 245, 255, 220), 1.5f);
+	ImGui::Dummy(ImVec2(0.0f, 6.0f));
+}
+
+static void RenderGearSettingsModal()
+{
+	if (!g_gearPopup.isOpen) return;
+
+	ImGui::OpenPopup("##FeatureGearModal");
+	ImGui::SetNextWindowSize(ImVec2(340.0f, 320.0f), ImGuiCond_Always);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, IM_COL32(14, 15, 22, 252));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(50, 56, 76, 255));
+
+	if (ImGui::BeginPopupModal("##FeatureGearModal", &g_gearPopup.isOpen, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
+	{
+		// Header
+		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+		ImGui::Text("%s  %s Settings", ICON_FA_COG, g_gearPopup.featureName);
+		ImGui::PopStyleColor();
+		ImGui::Separator();
+		ImGui::Spacing();
+
+		// 1. Hotkey Assignment
+		ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "Activation Hotkey");
+		CustomCombo("Select Key", "##gearKey", &g_gearPopup.keyIdx, g_keybindList, sizeof(g_keybindList) / sizeof(g_keybindList[0]));
+
+		static const char* bindModes[] = { "Hold Key", "Toggle On/Off", "Always Enabled" };
+		CustomCombo("Bind Trigger Mode", "##gearMode", &g_gearPopup.bindMode, bindModes, 3);
+
+		ImGui::Spacing();
+
+		// 2. Color Selection
+		ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "Feature Accent / ESP Color");
+		ImGui::ColorEdit4("##gearColorPicker", g_gearPopup.color, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+
+		ImGui::SameLine();
+		ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, 1.0f), "HEX: #%02X%02X%02X",
+			(int)(g_gearPopup.color[0] * 255), (int)(g_gearPopup.color[1] * 255), (int)(g_gearPopup.color[2] * 255));
+
+		// Preset Quick Swatches
+		ImGui::Spacing();
+		ImGui::TextColored(ImVec4(0.6f, 0.65f, 0.75f, 1.0f), "Quick Swatches:");
+		struct PresetColor { const char* name; float r, g, b; };
+		static PresetColor presets[] = {
+			{ "White", 1.0f, 1.0f, 1.0f },
+			{ "Cyan",  0.0f, 0.9f, 1.0f },
+			{ "Violet",0.7f, 0.3f, 1.0f },
+			{ "Red",   1.0f, 0.2f, 0.3f },
+			{ "Green", 0.2f, 1.0f, 0.4f },
+			{ "Gold",  1.0f, 0.8f, 0.1f }
+		};
+		for (int c = 0; c < 6; c++)
+		{
+			if (c > 0) ImGui::SameLine();
+			ImGui::PushID(9000 + c);
+			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(presets[c].r, presets[c].g, presets[c].b, 1.0f));
+			if (ImGui::Button("##swatch", ImVec2(22.0f, 22.0f)))
+			{
+				g_gearPopup.color[0] = presets[c].r;
+				g_gearPopup.color[1] = presets[c].g;
+				g_gearPopup.color[2] = presets[c].b;
+			}
+			ImGui::PopStyleColor();
+			ImGui::PopID();
+		}
+
+		ImGui::Spacing();
+		ImGui::Spacing();
+
+		// Save and Close Button
+		float availW = ImGui::GetContentRegionAvail().x;
+		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(245, 248, 255, 255));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 225, 240, 255));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(255, 255, 255, 255));
+		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(11, 12, 16, 255));
+		if (ImGui::Button("Save & Close", ImVec2(availW, 30.0f)))
+		{
+			g_gearPopup.isOpen = false;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::PopStyleColor(4);
+
+		ImGui::EndPopup();
+	}
+	ImGui::PopStyleColor(2);
+	ImGui::PopStyleVar(2);
+}
+
+bool LoadAnimatedGIF(ID3D11Device* device, const unsigned char* data, size_t dataSize)
+{
+	int width, height, frames, channels;
+	int* delays = nullptr;
+
+	unsigned char* pixels = stbi_load_gif_from_memory(data, (int)dataSize, &delays, &width, &height, &frames, &channels, 4);
+
+	if (!pixels || frames == 0)
+	{
+		if (pixels) stbi_image_free(pixels);
+		if (delays) stbi_image_free(delays);
+		return false;
+	}
+
+	logoFrameCount = frames;
+	logoDelays = delays;
+	logoFrames.clear();
+
+	for (int i = 0; i < frames; i++)
+	{
+		unsigned char* frameData = pixels + (width * height * 4 * i);
+
+		D3D11_TEXTURE2D_DESC texDesc = {};
+		texDesc.Width = width;
+		texDesc.Height = height;
+		texDesc.MipLevels = 1;
+		texDesc.ArraySize = 1;
+		texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		texDesc.SampleDesc.Count = 1;
+		texDesc.Usage = D3D11_USAGE_DEFAULT;
+		texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+		D3D11_SUBRESOURCE_DATA initData = {};
+		initData.pSysMem = frameData;
+		initData.SysMemPitch = width * 4;
+
+		ID3D11Texture2D* texture = nullptr;
+		device->CreateTexture2D(&texDesc, &initData, &texture);
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+
+		ID3D11ShaderResourceView* srv = nullptr;
+		device->CreateShaderResourceView(texture, &srvDesc, &srv);
+		logoFrames.push_back(srv);
+
+		texture->Release();
+	}
+
+	stbi_image_free(pixels);
+	return true;
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
+{
+	WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, hInstance, nullptr, nullptr, nullptr, nullptr, _T("redEngineOverlayPreview"), nullptr };
+	RegisterClassEx(&wc);
+
+	int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+	int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+	int posX = 0;
+	int posY = 0;
+	int winWidth = screenWidth;
+	int winHeight = screenHeight;
+
+	HWND hWnd = CreateWindowEx(
+		WS_EX_TOPMOST | WS_EX_LAYERED,
+		wc.lpszClassName,
+		_T("redENGINE Overlay Preview"),
+		WS_POPUP,
+		posX, posY, winWidth, winHeight,
+		nullptr, nullptr, wc.hInstance, nullptr
+	);
+
+	SetLayeredWindowAttributes(hWnd, RGB(0, 0, 0), 255, LWA_ALPHA);
+
+	MARGINS margins = { -1, -1, -1, -1 };
+	DwmExtendFrameIntoClientArea(hWnd, &margins);
+
+	if (!CreateDeviceD3D(hWnd))
+	{
+		CleanupDeviceD3D();
+		UnregisterClass(wc.lpszClassName, wc.hInstance);
+		return 1;
+	}
+
+	ShowWindow(hWnd, SW_SHOWDEFAULT);
+	UpdateWindow(hWnd);
+
+	// Setup Dear ImGui context
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGuiIO& io = ImGui::GetIO();
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+	io.IniFilename = nullptr;
+
+	ImGui_ImplWin32_Init(hWnd);
+	ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+	// Set style colors for 2026 Luxury Obsidian aesthetic
+	ImGuiStyle& style = ImGui::GetStyle();
+	style.WindowRounding = 10.0f;
+	style.ChildRounding = 8.0f;
+	style.FrameRounding = 5.0f;
+	style.PopupRounding = 6.0f;
+	style.ScrollbarRounding = 8.0f;
+	style.GrabRounding = 5.0f;
+	style.TabRounding = 5.0f;
+	style.WindowBorderSize = 1.0f;
+	style.ChildBorderSize = 1.0f;
+	style.FrameBorderSize = 1.0f;
+	style.PopupBorderSize = 1.0f;
+	style.ItemSpacing = ImVec2(10.0f, 8.0f);
+	style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
+	style.FramePadding = ImVec2(10.0f, 6.0f);
+	style.ScrollbarSize = 6.0f;
+
+	style.Colors[ImGuiCol_WindowBg]             = ImVec4(11 / 255.0f, 12 / 255.0f, 16 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_ChildBg]              = ImVec4(14 / 255.0f, 15 / 255.0f, 21 / 255.0f, 0.95f);
+	style.Colors[ImGuiCol_PopupBg]              = ImVec4(14 / 255.0f, 15 / 255.0f, 21 / 255.0f, 0.98f);
+	style.Colors[ImGuiCol_Border]               = ImVec4(32 / 255.0f, 35 / 255.0f, 46 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_BorderShadow]         = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+	style.Colors[ImGuiCol_FrameBg]              = ImVec4(18 / 255.0f, 20 / 255.0f, 28 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_FrameBgHovered]       = ImVec4(26 / 255.0f, 29 / 255.0f, 40 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_FrameBgActive]        = ImVec4(34 / 255.0f, 38 / 255.0f, 52 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_TitleBg]              = ImVec4(11 / 255.0f, 12 / 255.0f, 16 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_TitleBgActive]        = ImVec4(14 / 255.0f, 15 / 255.0f, 21 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_ScrollbarBg]          = ImVec4(11 / 255.0f, 12 / 255.0f, 16 / 255.0f, 0.5f);
+	style.Colors[ImGuiCol_ScrollbarGrab]        = ImVec4(38 / 255.0f, 42 / 255.0f, 56 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(55 / 255.0f, 60 / 255.0f, 80 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_ScrollbarGrabActive]  = ImVec4(85 / 255.0f, 92 / 255.0f, 120 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_CheckMark]            = ImVec4(245 / 255.0f, 248 / 255.0f, 255 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_SliderGrab]           = ImVec4(245 / 255.0f, 248 / 255.0f, 255 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_SliderGrabActive]     = ImVec4(255 / 255.0f, 255 / 255.0f, 255 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_Button]               = ImVec4(20 / 255.0f, 22 / 255.0f, 30 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_ButtonHovered]        = ImVec4(32 / 255.0f, 35 / 255.0f, 48 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_ButtonActive]         = ImVec4(45 / 255.0f, 50 / 255.0f, 68 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_Header]               = ImVec4(26 / 255.0f, 28 / 255.0f, 38 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_HeaderHovered]        = ImVec4(38 / 255.0f, 42 / 255.0f, 56 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_HeaderActive]         = ImVec4(52 / 255.0f, 58 / 255.0f, 78 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_Separator]            = ImVec4(32 / 255.0f, 35 / 255.0f, 46 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_Text]                 = ImVec4(230 / 255.0f, 232 / 255.0f, 242 / 255.0f, 1.0f);
+	style.Colors[ImGuiCol_TextDisabled]         = ImVec4(110 / 255.0f, 115 / 255.0f, 130 / 255.0f, 1.0f);
+
+	// Load Fonts: Main text font + FontAwesome icons merged
+	g_fontMain = io.Fonts->AddFontFromMemoryTTF(inter_medium, sizeof(inter_medium), 14.5f);
+
+	static const ImWchar icons_ranges[] = { ICON_MIN_FA, ICON_MAX_FA, 0 };
+	ImFontConfig icons_config;
+	icons_config.MergeMode = true;
+	icons_config.PixelSnapH = true;
+	io.Fonts->AddFontFromMemoryCompressedTTF(font_awesome_data, font_awesome_size, 14.5f, &icons_config, icons_ranges);
+
+	// Separate larger font for sidebar icons (more prominent and spacious)
+	ImFontConfig separate_icon_cfg;
+	separate_icon_cfg.PixelSnapH = true;
+	g_fontSidebarIcons = io.Fonts->AddFontFromMemoryCompressedTTF(font_awesome_data, font_awesome_size, 20.0f, &separate_icon_cfg, icons_ranges);
+
+	// Micro font for sidebar pill labels
+	g_fontSmall = io.Fonts->AddFontFromMemoryTTF(inter_medium, sizeof(inter_medium), 10.0f);
+
+	LoadAnimatedGIF(g_pd3dDevice, logo_anim2, sizeof(logo_anim2));
+
+	// Initial editor state (clean)
+	editor.SetText("");
+
+	// Main message loop
+	bool done = false;
+	while (!done)
+	{
+		MSG msg;
+		while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE))
+		{
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+			if (msg.message == WM_QUIT)
+				done = true;
+		}
+		if (done)
+			break;
+
+		// Update GIF animation
+		if (logoFrameCount > 0 && logoDelays)
+		{
+			logoAnimTime += io.DeltaTime;
+			float frameDuration = (float)logoDelays[currentLogoFrame] / 1000.0f;
+			if (frameDuration < 0.016f) frameDuration = 0.016f;
+
+			if (logoAnimTime >= frameDuration)
+			{
+				logoAnimTime -= frameDuration;
+				currentLogoFrame = (currentLogoFrame + 1) % logoFrameCount;
+			}
+		}
+
+		ImGui_ImplDX11_NewFrame();
+		ImGui_ImplWin32_NewFrame();
+		ImGui::NewFrame();
+
+		if (guiVisible)
+		{
+			// =========================================================================
+			// UNIFIED 2026 LUXURY OBSIDIAN WINDOW (940 × 640)
+			// Single centered window, no detached desktop bars!
+			// =========================================================================
+			const float windowWidth = 940.0f;
+			const float windowHeight = 640.0f;
+			float windowStartX = (io.DisplaySize.x - windowWidth) * 0.5f;
+			float windowStartY = (io.DisplaySize.y - windowHeight) * 0.5f;
+
+			// =========================================================================
+			// 1. ONLINE MENU WINDOW (Exact same 830x570 size as Resources)
+			// =========================================================================
+			if (g_dockMode == DOCK_ONLINE)
+			{
+				ImGui::SetNextWindowPos(ImVec2(windowStartX, windowStartY), ImGuiCond_Always);
+				ImGui::SetNextWindowSize(ImVec2(windowWidth, windowHeight), ImGuiCond_Always);
+
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+				ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(11, 12, 16, 255));
+				ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+
+				ImGui::Begin("OnlineMenuWindow", nullptr,
+					ImGuiWindowFlags_NoTitleBar |
+					ImGuiWindowFlags_NoResize |
+					ImGuiWindowFlags_NoScrollbar
+				);
+
+				ImDrawList* oDrawList = ImGui::GetWindowDrawList();
+				ImVec2 oWinPos = ImGui::GetWindowPos();
+
+				// Solid obsidian background for unified window
+				oDrawList->AddRectFilled(
+					oWinPos,
+					ImVec2(oWinPos.x + windowWidth, oWinPos.y + windowHeight),
+					IM_COL32(11, 12, 16, 255),
+					10.0f
+				);
+
+				// ==========================================
+				// 0. INTEGRATED MASTER TITLEBAR (42px)
+				// ==========================================
+				float titleBarH = 42.0f;
+				ImVec2 titleBarMin = oWinPos;
+				ImVec2 titleBarMax = ImVec2(oWinPos.x + windowWidth, oWinPos.y + titleBarH);
+
+				// Titlebar solid dark glass background
+				oDrawList->AddRectFilled(
+					titleBarMin,
+					titleBarMax,
+					IM_COL32(10, 11, 15, 255),
+					10.0f,
+					ImDrawCornerFlags_Top
+				);
+
+				// Bottom hairline divider
+				oDrawList->AddLine(
+					ImVec2(oWinPos.x, oWinPos.y + titleBarH),
+					ImVec2(oWinPos.x + windowWidth, oWinPos.y + titleBarH),
+					IM_COL32(28, 30, 42, 255),
+					1.0f
+				);
+
+				// Window dragging handling (within titlebar, when not clicking interactive elements)
+				ImVec2 mousePos = ImGui::GetMousePos();
+				bool inTitleBar = (mousePos.x >= titleBarMin.x && mousePos.x <= titleBarMax.x &&
+								   mousePos.y >= titleBarMin.y && mousePos.y <= titleBarMax.y);
+				if (inTitleBar && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered())
+				{
+					ReleaseCapture();
+					SendMessage(hWnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+				}
+
+				// Center: 3-Module Segmented Pill Switcher
+				// Tabs: [ Online Menu ]   [ Lua Executor ]   [ Docs ]
+				float segTotalW = 340.0f;
+				float segH = 28.0f;
+				float segX = oWinPos.x + (windowWidth - segTotalW) * 0.5f;
+				float segY = oWinPos.y + (titleBarH - segH) * 0.5f;
+
+				// Pill background capsule
+				oDrawList->AddRectFilled(
+					ImVec2(segX, segY),
+					ImVec2(segX + segTotalW, segY + segH),
+					IM_COL32(15, 17, 23, 220),
+					6.0f
+				);
+				oDrawList->AddRect(
+					ImVec2(segX, segY),
+					ImVec2(segX + segTotalW, segY + segH),
+					IM_COL32(28, 31, 42, 200),
+					6.0f
+				);
+
+				struct ModuleTab {
+					const char* icon;
+					const char* label;
+					int mode;
+				};
+				ModuleTab moduleTabs[] = {
+					{ ICON_FA_GLOBE, "Online Menu", DOCK_ONLINE },
+					{ ICON_FA_CODE,  "Lua Executor", DOCK_RESOURCES },
+					{ ICON_FA_BOOK,  "Docs", DOCK_DOCS }
+				};
+
+				float tabW = (segTotalW - 8.0f) / 3.0f;
+				for (int m = 0; m < 3; m++)
+				{
+					float tx = segX + 4.0f + m * tabW;
+					float ty = segY + 3.0f;
+					float th = segH - 6.0f;
+					ImVec2 tMin = ImVec2(tx, ty);
+					ImVec2 tMax = ImVec2(tx + tabW, ty + th);
+
+					bool isCur = (g_dockMode == moduleTabs[m].mode);
+
+					ImGui::SetCursorScreenPos(tMin);
+					ImGui::PushID(1500 + m);
+					bool tClicked = ImGui::InvisibleButton("##modTabBtn", ImVec2(tabW, th));
+					bool tHovered = ImGui::IsItemHovered();
+					ImGui::PopID();
+
+					if (tClicked)
+					{
+						g_dockMode = moduleTabs[m].mode;
+					}
+
+					if (isCur)
+					{
+						oDrawList->AddRectFilled(tMin, tMax, IM_COL32(32, 36, 50, 255), 4.0f);
+						oDrawList->AddRect(tMin, tMax, IM_COL32(245, 248, 255, 220), 4.0f, 15, 1.0f);
+					}
+					else if (tHovered)
+					{
+						oDrawList->AddRectFilled(tMin, tMax, IM_COL32(22, 25, 35, 220), 4.0f);
+					}
+
+					ImU32 tabCol = isCur ? IM_COL32(255, 255, 255, 255) :
+						(tHovered ? IM_COL32(220, 225, 240, 255) : IM_COL32(130, 135, 150, 255));
+
+					char tabBuf[64];
+					sprintf_s(tabBuf, "%s  %s", moduleTabs[m].icon, moduleTabs[m].label);
+					ImVec2 tSz = ImGui::CalcTextSize(tabBuf);
+					oDrawList->AddText(
+						ImVec2(tx + (tabW - tSz.x) * 0.5f, ty + (th - tSz.y) * 0.5f),
+						tabCol,
+						tabBuf
+					);
+				}
+
+				// Right Side: Live FiveM Status Pill + Window Controls (Minimize / Close)
+				float rightX = oWinPos.x + windowWidth - 14.0f;
+
+				// Close Button (X)
+				float btnH = 26.0f;
+				float btnW = 28.0f;
+				float closeX = rightX - btnW;
+				float ctrlY = oWinPos.y + (titleBarH - btnH) * 0.5f;
+
+				ImGui::SetCursorScreenPos(ImVec2(closeX, ctrlY));
+				ImGui::PushID(1600);
+				bool closeClicked = ImGui::InvisibleButton("##titleClose", ImVec2(btnW, btnH));
+				bool closeHovered = ImGui::IsItemHovered();
+				ImGui::PopID();
+
+				if (closeClicked)
+				{
+					PostQuitMessage(0);
+				}
+
+				if (closeHovered)
+				{
+					oDrawList->AddRectFilled(ImVec2(closeX, ctrlY), ImVec2(closeX + btnW, ctrlY + btnH), IM_COL32(215, 45, 55, 240), 5.0f);
+				}
+				ImVec2 xSz = ImGui::CalcTextSize(ICON_FA_TIMES);
+				oDrawList->AddText(
+					ImVec2(closeX + (btnW - xSz.x) * 0.5f, ctrlY + (btnH - xSz.y) * 0.5f),
+					closeHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(150, 155, 170, 255),
+					ICON_FA_TIMES
+				);
+
+				// Minimize Button (_)
+				float minX = closeX - btnW - 4.0f;
+				ImGui::SetCursorScreenPos(ImVec2(minX, ctrlY));
+				ImGui::PushID(1601);
+				bool minClicked = ImGui::InvisibleButton("##titleMin", ImVec2(btnW, btnH));
+				bool minHovered = ImGui::IsItemHovered();
+				ImGui::PopID();
+
+				if (minClicked)
+				{
+					ShowWindow(hWnd, SW_MINIMIZE);
+				}
+
+				if (minHovered)
+				{
+					oDrawList->AddRectFilled(ImVec2(minX, ctrlY), ImVec2(minX + btnW, ctrlY + btnH), IM_COL32(26, 30, 42, 240), 5.0f);
+				}
+				ImVec2 minSz = ImGui::CalcTextSize(ICON_FA_MINUS);
+				oDrawList->AddText(
+					ImVec2(minX + (btnW - minSz.x) * 0.5f, ctrlY + (btnH - minSz.y) * 0.5f),
+					minHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(150, 155, 170, 255),
+					ICON_FA_MINUS
+				);
+
+				// ==========================================
+				// 1. LEFT SIDEBAR (Icon Navigation) - 78px
+				// Starts below 42px titlebar, extends to window bottom
+				// ==========================================
+				float catColWidth = 78.0f;
+				float sidebarStartY = oWinPos.y + titleBarH;
+				float sidebarEndY = oWinPos.y + windowHeight;
+
+				oDrawList->AddRectFilled(
+					ImVec2(oWinPos.x, sidebarStartY),
+					ImVec2(oWinPos.x + catColWidth, sidebarEndY),
+					IM_COL32(8, 9, 12, 255),
+					10.0f,
+					ImDrawCornerFlags_BotLeft
+				);
+
+				// Right divider line for sidebar
+				oDrawList->AddLine(
+					ImVec2(oWinPos.x + catColWidth, sidebarStartY),
+					ImVec2(oWinPos.x + catColWidth, sidebarEndY),
+					IM_COL32(26, 28, 36, 255),
+					1.0f
+				);
+
+				// --- Top Logo Slot (42px) with Animated GIF ---
+				float logoSlotSize = 42.0f;
+				float logoX = oWinPos.x + (catColWidth - logoSlotSize) / 2.0f;
+				float logoY = sidebarStartY + 8.0f;
+
+				oDrawList->AddRectFilled(
+					ImVec2(logoX, logoY),
+					ImVec2(logoX + logoSlotSize, logoY + logoSlotSize),
+					IM_COL32(18, 17, 21, 255),
+					7.0f
+				);
+				oDrawList->AddRect(
+					ImVec2(logoX, logoY),
+					ImVec2(logoX + logoSlotSize, logoY + logoSlotSize),
+					IM_COL32(230, 230, 240, 220),
+					7.0f,
+					15,
+					1.5f
+				);
+
+				if (logoFrameCount > 0 && currentLogoFrame < (int)logoFrames.size())
+				{
+					oDrawList->PushClipRect(ImVec2(logoX + 2, logoY + 2), ImVec2(logoX + logoSlotSize - 2, logoY + logoSlotSize - 2), true);
+					oDrawList->AddImageRounded(
+						(void*)logoFrames[currentLogoFrame],
+						ImVec2(logoX + 2, logoY + 2),
+						ImVec2(logoX + logoSlotSize - 2, logoY + logoSlotSize - 2),
+						ImVec2(0, 0), ImVec2(1, 1),
+						IM_COL32_WHITE,
+						5.0f
+					);
+					oDrawList->PopClipRect();
+				}
+
+				// --- Sidebar Category Navigation: Icon + Name Style (Clean Monochrome Minimalist) ---
+				struct OnlineCatItem {
+					const char* icon;
+					const char* label;
+				};
+
+				static const OnlineCatItem onlineCats[] = {
+					{ ICON_FA_USERS,      "Players" },
+					{ ICON_FA_CROSSHAIRS, "Combat" },
+					{ ICON_FA_EYE,        "Visuals" },
+					{ ICON_FA_GLOBE,      "World" },
+					{ ICON_FA_SHIELD_ALT, "Self" },
+					{ ICON_FA_CAR,        "Vehicles" },
+					{ ICON_FA_SLIDERS_H,  "Configs" }
+				};
+				const int onlineCatCount = sizeof(onlineCats) / sizeof(onlineCats[0]);
+
+				float startY = logoY + logoSlotSize + 8.0f;
+				float itemHeight = 44.0f;
+
+				ImGui::PushFont(g_fontSidebarIcons);
+
+				for (int i = 0; i < onlineCatCount; i++)
+				{
+					float itemY = startY + i * itemHeight;
+					bool isSelected = (g_onlineCategory == i);
+
+					ImVec2 cardMin = ImVec2(oWinPos.x + 8.0f, itemY);
+					ImVec2 cardMax = ImVec2(oWinPos.x + catColWidth - 8.0f, itemY + itemHeight - 4.0f);
+
+					ImGui::SetCursorScreenPos(cardMin);
+					ImGui::PushID(200 + i);
+
+					bool clicked = ImGui::InvisibleButton("##onlineCatBtn", ImVec2(catColWidth - 16.0f, itemHeight - 4.0f));
+					bool isHovered = ImGui::IsItemHovered();
+
+					if (clicked)
+					{
+						g_onlineCategory = i;
+					}
+
+					// Hover background
+					if (isHovered && !isSelected)
+					{
+						oDrawList->AddRectFilled(
+							cardMin,
+							cardMax,
+							IM_COL32(24, 27, 38, 220),
+							6.0f
+						);
+					}
+
+					// Active Tab Pure White Indicator Bar on Left Edge
+					if (isSelected)
+					{
+						oDrawList->AddRectFilled(
+							cardMin,
+							cardMax,
+							IM_COL32(28, 32, 45, 255),
+							6.0f
+						);
+						oDrawList->AddRect(
+							cardMin,
+							cardMax,
+							IM_COL32(245, 248, 255, 220),
+							6.0f,
+							15,
+							1.0f
+						);
+						oDrawList->AddRectFilled(
+							ImVec2(cardMin.x, cardMin.y + 6.0f),
+							ImVec2(cardMin.x + 3.0f, cardMax.y - 6.0f),
+							IM_COL32(255, 255, 255, 255),
+							2.0f
+						);
+					}
+
+					ImU32 iconCol = isSelected ? IM_COL32(255, 255, 255, 255) :
+						(isHovered ? IM_COL32(240, 240, 245, 255) : IM_COL32(130, 130, 138, 255));
+
+					ImVec2 iconSize = ImGui::CalcTextSize(onlineCats[i].icon);
+					ImVec2 iconPos = ImVec2(
+						cardMin.x + (cardMax.x - cardMin.x - iconSize.x) * 0.5f,
+						cardMin.y + (cardMax.y - cardMin.y - iconSize.y) * 0.5f
+					);
+
+					oDrawList->AddText(iconPos, iconCol, onlineCats[i].icon);
+
+					ImGui::PopID();
+				}
+
+				// --- Bottom Settings Gear Icon ---
+				float settingsY = oWinPos.y + windowHeight - 48.0f;
+
+				ImVec2 setMin = ImVec2(oWinPos.x + 8.0f, settingsY);
+				ImVec2 setMax = ImVec2(oWinPos.x + catColWidth - 8.0f, settingsY + 38.0f);
+
+				ImGui::SetCursorScreenPos(setMin);
+				bool settingsClicked = ImGui::InvisibleButton("##onlineSettingsBtn", ImVec2(catColWidth - 16.0f, 38.0f));
+				bool settingsHovered = ImGui::IsItemHovered();
+
+				if (settingsHovered)
+				{
+					oDrawList->AddRectFilled(setMin, setMax, IM_COL32(24, 27, 38, 220), 6.0f);
+				}
+
+				ImVec2 settingsIconSize = ImGui::CalcTextSize(ICON_FA_COG);
+				ImVec2 settingsIconPos = ImVec2(
+					setMin.x + (setMax.x - setMin.x - settingsIconSize.x) * 0.5f,
+					setMin.y + (setMax.y - setMin.y - settingsIconSize.y) * 0.5f
+				);
+				oDrawList->AddText(settingsIconPos, settingsHovered ? IM_COL32(240, 240, 245, 255) : IM_COL32(130, 130, 138, 255), ICON_FA_COG);
+
+				ImGui::PopFont();
+
+				// --- Header Area (Right of Sidebar) ---
+				float headerHeight = 86.0f;
+				float headerLeft = oWinPos.x + catColWidth + 18.0f;
+				float headerY = oWinPos.y + 42.0f + 11.0f;
+
+				// Dynamic Category Title & Subtitle
+				const char* catTitle = "Player List";
+				const char* catSubtitle = "|  14 Connected Players & Trolling Actions";
+				if (g_onlineCategory == ONLINE_PLAYERS) { catTitle = "Player List"; catSubtitle = "|  14 Connected Players & Trolling Actions"; }
+				else if (g_onlineCategory == ONLINE_COMBAT) { catTitle = "Combat"; catSubtitle = "|  Combat Assist, Aim & Fire Modes"; }
+				else if (g_onlineCategory == ONLINE_VISUALS) { catTitle = "Visuals & ESP"; catSubtitle = "|  Player ESP, Chams, World Radar & Preview"; }
+				else if (g_onlineCategory == ONLINE_WORLD) { catTitle = "World"; catSubtitle = "|  Map, Teleportation & Environmental Controls"; }
+				else if (g_onlineCategory == ONLINE_SELF) { catTitle = "Self"; catSubtitle = "|  Player Health, Stamina & Movement Physics"; }
+				else if (g_onlineCategory == ONLINE_VEHICLES) { catTitle = "Vehicles"; catSubtitle = "|  Vehicle Spawning, Repair & Handling"; }
+				else if (g_onlineCategory == ONLINE_CONFIGS) { catTitle = "Config Manager"; catSubtitle = "|  Preset Profiles, Cloud Sync & Custom Binds"; }
+
+				oDrawList->AddText(ImVec2(headerLeft, headerY + 1.0f), IM_COL32(245, 245, 250, 255), catTitle);
+				ImVec2 catTitleSize = ImGui::CalcTextSize(catTitle);
+				oDrawList->AddText(ImVec2(headerLeft + catTitleSize.x + 8.0f, headerY + 2.0f), IM_COL32(120, 120, 130, 255), catSubtitle);
+
+				// Search input field in header on right
+				float searchW = 180.0f;
+				float searchX = oWinPos.x + windowWidth - searchW - 20.0f;
+				float searchY = oWinPos.y + 42.0f + 9.0f;
+				ImGui::SetCursorScreenPos(ImVec2(searchX, searchY));
+				ImGui::PushItemWidth(searchW);
+				ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 20, 26, 255));
+				ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(38, 38, 46, 255));
+				ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(220, 220, 230, 255));
+				ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8, 4));
+				ImGui::InputTextWithHint("##PlayerSearch", "Search player / ID...", g_playerSearch, sizeof(g_playerSearch));
+				ImGui::PopStyleVar(2);
+				ImGui::PopStyleColor(3);
+				ImGui::PopItemWidth();
+
+				// Divider under header
+				oDrawList->AddLine(
+					ImVec2(oWinPos.x + catColWidth + 12.0f, oWinPos.y + headerHeight),
+					ImVec2(oWinPos.x + windowWidth - 12.0f, oWinPos.y + headerHeight),
+					IM_COL32(28, 28, 34, 255),
+					1.0f
+				);
+
+				// =====================================================================
+				// A) If Player List Category Selected: Render Player List & Trolling
+				// =====================================================================
+				if (g_onlineCategory == ONLINE_PLAYERS)
+				{
+					float bodyY = oWinPos.y + headerHeight + 8.0f;
+					float bodyH = windowHeight - headerHeight - 16.0f;
+					float leftPaneW = 245.0f;
+					float rightPaneW = windowWidth - catColWidth - leftPaneW - 22.0f;
+
+					// --- Sub-Pane 1: Player List ---
+					ImGui::SetCursorScreenPos(ImVec2(oWinPos.x + catColWidth + 8.0f, bodyY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(13, 14, 20, 240));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6, 6));
+
+					ImGui::BeginChild("OnlinePlayerList", ImVec2(leftPaneW, bodyH), true);
+					{
+						int matchedCount = 0;
+						for (int i = 0; i < g_playerCount; i++)
+						{
+							if (g_playerSearch[0] != '\0')
+							{
+								char idBuf[16];
+								sprintf_s(idBuf, "%d", g_onlinePlayers[i].id);
+								std::string needle = g_playerSearch;
+								for (auto& c : needle) c = (char)tolower(c);
+								std::string nameStr = g_onlinePlayers[i].name;
+								for (auto& c : nameStr) c = (char)tolower(c);
+
+								if (nameStr.find(needle) == std::string::npos && std::string(idBuf).find(needle) == std::string::npos)
+								{
+									continue;
+								}
+							}
+							matchedCount++;
+
+							bool isSelected = (g_selectedPlayerIdx == i);
+							ImVec2 itemPos = ImGui::GetCursorScreenPos();
+							float itemW = ImGui::GetContentRegionAvail().x;
+							float itemH = 48.0f;
+
+							ImGui::PushID(500 + i);
+							if (ImGui::InvisibleButton("##playerItem", ImVec2(itemW, itemH)))
+							{
+								g_selectedPlayerIdx = i;
+							}
+							bool isHovered = ImGui::IsItemHovered();
+							ImGui::PopID();
+
+							ImDrawList* cDraw = ImGui::GetWindowDrawList();
+							ImVec2 pMin = itemPos;
+							ImVec2 pMax = ImVec2(itemPos.x + itemW, itemPos.y + itemH);
+
+							ImU32 bgCol = isSelected ? IM_COL32(30, 34, 48, 255) :
+								(isHovered ? IM_COL32(24, 27, 38, 255) : IM_COL32(18, 20, 28, 255));
+							ImU32 borderCol = isSelected ? IM_COL32(80, 90, 125, 255) :
+								(isHovered ? IM_COL32(50, 56, 76, 255) : IM_COL32(30, 33, 44, 255));
+
+							cDraw->AddRectFilled(pMin, pMax, bgCol, 6.0f);
+							cDraw->AddRect(pMin, pMax, borderCol, 6.0f);
+
+							if (isSelected)
+							{
+								cDraw->AddRectFilled(
+									ImVec2(pMin.x, pMin.y + 4.0f),
+									ImVec2(pMin.x + 3.5f, pMax.y - 4.0f),
+									IM_COL32(255, 255, 255, 255),
+									2.0f
+								);
+							}
+
+							// Name
+							cDraw->AddText(
+								ImVec2(pMin.x + 12.0f, pMin.y + 6.0f),
+								isSelected ? IM_COL32(255, 255, 255, 255) : (isHovered ? IM_COL32(240, 242, 250, 255) : IM_COL32(220, 222, 230, 255)),
+								g_onlinePlayers[i].name
+							);
+
+							// ID tag on the right
+							char idStr[16];
+							sprintf_s(idStr, "[#%d]", g_onlinePlayers[i].id);
+							ImVec2 idSz = ImGui::CalcTextSize(idStr);
+							cDraw->AddText(
+								ImVec2(pMax.x - idSz.x - 10.0f, pMin.y + 6.0f),
+								isSelected ? IM_COL32(255, 255, 255, 255) : IM_COL32(120, 125, 140, 255),
+								idStr
+							);
+
+							// Subtitle
+							char subInfo[64];
+							if (g_onlinePlayers[i].distance >= 1000.0f)
+								sprintf_s(subInfo, "%.1fkm | %dms", g_onlinePlayers[i].distance / 1000.0f, g_onlinePlayers[i].ping);
+							else
+								sprintf_s(subInfo, "%.0fm | %dms", g_onlinePlayers[i].distance, g_onlinePlayers[i].ping);
+
+							cDraw->AddText(
+								ImVec2(pMin.x + 12.0f, pMin.y + 25.0f),
+								IM_COL32(130, 135, 150, 255),
+								subInfo
+							);
+
+							ImGui::SetCursorScreenPos(ImVec2(itemPos.x, itemPos.y + itemH + 3.0f));
+						}
+
+						if (matchedCount == 0)
+						{
+							ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 40.0f);
+							ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.0f), "  No players match.");
+						}
+					}
+					ImGui::EndChild();
+					ImGui::PopStyleVar(2);
+					ImGui::PopStyleColor(2);
+
+					// --- Sub-Pane 2: Selected Player Details & Trolling Options ---
+					float rightX = oWinPos.x + catColWidth + leftPaneW + 14.0f;
+					ImGui::SetCursorScreenPos(ImVec2(rightX, bodyY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(13, 14, 20, 240));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 12));
+
+					ImGui::BeginChild("OnlineTrollPanel", ImVec2(rightPaneW, bodyH), true);
+					{
+						if (g_selectedPlayerIdx >= 0 && g_selectedPlayerIdx < g_playerCount)
+						{
+							OnlinePlayer& p = g_onlinePlayers[g_selectedPlayerIdx];
+							ImDrawList* rDraw = ImGui::GetWindowDrawList();
+							ImVec2 rStart = ImGui::GetCursorScreenPos();
+							float rContentW = ImGui::GetContentRegionAvail().x;
+
+							// 1. Target Player Banner Box (Ultra-Clean Modern Minimalist)
+							float bannerH = 64.0f;
+							ImVec2 bMin = rStart;
+							ImVec2 bMax = ImVec2(rStart.x + rContentW, rStart.y + bannerH);
+							rDraw->AddRectFilled(bMin, bMax, IM_COL32(18, 20, 28, 255), 7.0f);
+							rDraw->AddRect(bMin, bMax, IM_COL32(36, 40, 56, 255), 7.0f);
+							rDraw->AddRectFilled(bMin, ImVec2(bMax.x, bMin.y + 2.0f), IM_COL32(245, 248, 255, 220), 7.0f, ImDrawCornerFlags_Top);
+
+							// Left: Player Info
+							char headerName[128];
+							sprintf_s(headerName, "%s", p.name);
+							rDraw->AddText(ImVec2(bMin.x + 16.0f, bMin.y + 12.0f), IM_COL32(245, 248, 255, 255), headerName);
+
+							char idStr[16];
+							sprintf_s(idStr, "#%d", p.id);
+							ImVec2 nameSz = ImGui::CalcTextSize(headerName);
+							rDraw->AddText(ImVec2(bMin.x + 22.0f + nameSz.x, bMin.y + 12.0f), IM_COL32(240, 242, 255, 255), idStr);
+
+							char metaStr[128];
+							sprintf_s(metaStr, "%s   •   %.0fm   •   %dms", p.vehicle, p.distance, p.ping);
+							rDraw->AddText(ImVec2(bMin.x + 16.0f, bMin.y + 35.0f), IM_COL32(130, 135, 150, 255), metaStr);
+
+							// Right: Sleek Modern Health & Armor (Monochrome)
+							float barW = 150.0f;
+							float barX = bMax.x - barW - 16.0f;
+
+							// Health (HP)
+							rDraw->AddText(ImVec2(barX, bMin.y + 11.0f), IM_COL32(245, 248, 255, 255), "HP");
+							char hpStr[16];
+							sprintf_s(hpStr, "%.0f%%", p.health);
+							ImVec2 hpSz = ImGui::CalcTextSize(hpStr);
+							rDraw->AddText(ImVec2(barX + barW - hpSz.x, bMin.y + 11.0f), IM_COL32(220, 225, 235, 255), hpStr);
+
+							rDraw->AddRectFilled(ImVec2(barX, bMin.y + 25.0f), ImVec2(barX + barW, bMin.y + 29.0f), IM_COL32(28, 31, 42, 255), 2.0f);
+							float hpFrac = p.health / 100.0f;
+							if (hpFrac > 1.0f) hpFrac = 1.0f;
+							if (hpFrac < 0.0f) hpFrac = 0.0f;
+							if (hpFrac > 0.0f)
+							{
+								ImU32 hpCol = p.isDead ? IM_COL32(100, 105, 120, 255) : IM_COL32(245, 248, 255, 255);
+								rDraw->AddRectFilled(ImVec2(barX, bMin.y + 25.0f), ImVec2(barX + barW * hpFrac, bMin.y + 29.0f), hpCol, 2.0f);
+							}
+
+							// Armor (AP)
+							rDraw->AddText(ImVec2(barX, bMin.y + 34.0f), IM_COL32(170, 175, 190, 255), "AP");
+							char apStr[16];
+							sprintf_s(apStr, "%.0f%%", p.armor);
+							ImVec2 apSz = ImGui::CalcTextSize(apStr);
+							rDraw->AddText(ImVec2(barX + barW - apSz.x, bMin.y + 34.0f), IM_COL32(220, 225, 235, 255), apStr);
+
+							rDraw->AddRectFilled(ImVec2(barX, bMin.y + 48.0f), ImVec2(barX + barW, bMin.y + 52.0f), IM_COL32(28, 31, 42, 255), 2.0f);
+							float apFrac = p.armor / 100.0f;
+							if (apFrac > 1.0f) apFrac = 1.0f;
+							if (apFrac < 0.0f) apFrac = 0.0f;
+							if (apFrac > 0.0f)
+							{
+								rDraw->AddRectFilled(ImVec2(barX, bMin.y + 48.0f), ImVec2(barX + barW * apFrac, bMin.y + 52.0f), IM_COL32(170, 175, 190, 255), 2.0f);
+							}
+
+							// 2. Quick Action Buttons Row
+							ImGui::SetCursorScreenPos(ImVec2(rStart.x, rStart.y + bannerH + 8.0f));
+							float qGap = 6.0f;
+							float qBtnW = (rContentW - qGap * 3.0f) / 4.0f;
+							float qBtnH = 32.0f;
+
+							struct QuickBtn { const char* icon; const char* label; const char* actionName; };
+							QuickBtn qBtns[4] = {
+								{ ICON_FA_PLANE, "Teleport", "Teleported to" },
+								{ ICON_FA_MAGNET, "Bring", "Pulled & brought" },
+								{ ICON_FA_EYE, "Spectate", "Spectating" },
+								{ ICON_FA_COPY, "Copy Outfit", "Cloned outfit of" }
+							};
+
+							for (int q = 0; q < 4; q++)
+							{
+								if (q > 0) ImGui::SameLine(0, qGap);
+
+								char qLabel[64];
+								sprintf_s(qLabel, "%s  %s##q%d", qBtns[q].icon, qBtns[q].label, q);
+
+								ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(22, 24, 34, 255));
+								ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(36, 40, 56, 255));
+								ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(245, 248, 255, 255));
+								ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
+
+								if (ImGui::Button(qLabel, ImVec2(qBtnW, qBtnH)))
+								{
+									sprintf_s(g_trollStatusMsg, "[SUCCESS] %s player %s (ID: %d)", qBtns[q].actionName, p.name, p.id);
+									g_trollStatusTime = (float)ImGui::GetTime();
+									g_trollStatusSuccess = true;
+								}
+
+								ImGui::PopStyleVar();
+								ImGui::PopStyleColor(3);
+							}
+
+							// 3. Section Title: Trolling & Harassment Grid
+							ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10.0f);
+							ModernSectionHeader("TROLLING & INTERACTION OPTIONS", ICON_FA_USER_SECRET);
+
+							// 4. Trolling Grid (2 Columns)
+							float tGridGapX = 8.0f;
+							float tGridGapY = 6.0f;
+							float tCardW = (rContentW - tGridGapX) / 2.0f;
+							float tCardH = 34.0f;
+
+							for (int t = 0; t < g_trollActionCount; t++)
+							{
+								int col = t % 2;
+								if (col == 1) ImGui::SameLine(0, tGridGapX);
+
+								ImVec2 cardMin = ImGui::GetCursorScreenPos();
+								ImVec2 cardMax = ImVec2(cardMin.x + tCardW, cardMin.y + tCardH);
+
+								ImGui::PushID(800 + t);
+								bool clicked = ImGui::InvisibleButton("##trollcard", ImVec2(tCardW, tCardH));
+								bool hovered = ImGui::IsItemHovered();
+								ImGui::PopID();
+
+								if (clicked)
+								{
+									sprintf_s(g_trollStatusMsg, "[DISPATCHED] '%s' executed on %s (ID: %d)", g_trollActions[t].title, p.name, p.id);
+									g_trollStatusTime = (float)ImGui::GetTime();
+									g_trollStatusSuccess = true;
+								}
+
+								ImU32 cBg = clicked ? IM_COL32(40, 44, 62, 255) :
+									(hovered ? IM_COL32(28, 31, 42, 255) : IM_COL32(18, 20, 28, 255));
+								ImU32 cBorder = hovered ? IM_COL32(70, 78, 105, 255) : IM_COL32(32, 35, 48, 255);
+
+								rDraw->AddRectFilled(cardMin, cardMax, cBg, 6.0f);
+								rDraw->AddRect(cardMin, cardMax, cBorder, 6.0f);
+
+								rDraw->AddRectFilled(
+									cardMin,
+									ImVec2(cardMin.x + 3.0f, cardMax.y),
+									hovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(45, 50, 65, 255),
+									2.0f,
+									ImDrawCornerFlags_Left
+								);
+
+								ImVec2 tSz = ImGui::CalcTextSize(g_trollActions[t].title);
+								rDraw->AddText(
+									ImVec2(cardMin.x + 12.0f, cardMin.y + (tCardH - tSz.y) * 0.5f),
+									hovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(230, 232, 240, 255),
+									g_trollActions[t].title
+								);
+							}
+
+							// 5. Bottom Feedback Notification Bar
+							ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10.0f);
+							ImVec2 notifMin = ImGui::GetCursorScreenPos();
+							float notifH = 28.0f;
+							ImVec2 notifMax = ImVec2(notifMin.x + rContentW, notifMin.y + notifH);
+
+							float timeSinceTroll = (float)ImGui::GetTime() - g_trollStatusTime;
+							bool isRecent = (timeSinceTroll < 4.0f);
+							ImU32 notifBg = isRecent ? IM_COL32(28, 31, 44, 255) : IM_COL32(18, 20, 28, 255);
+							ImU32 notifBorder = isRecent ? IM_COL32(245, 248, 255, 200) : IM_COL32(32, 35, 48, 255);
+							ImU32 notifTextCol = isRecent ? IM_COL32(245, 248, 255, 255) : IM_COL32(130, 135, 150, 255);
+
+							rDraw->AddRectFilled(notifMin, notifMax, notifBg, 5.0f);
+							rDraw->AddRect(notifMin, notifMax, notifBorder, 5.0f);
+
+							rDraw->AddText(ImVec2(notifMin.x + 8.0f, notifMin.y + 6.0f), notifTextCol, ICON_FA_BOLT);
+							rDraw->AddText(ImVec2(notifMin.x + 26.0f, notifMin.y + 6.0f), notifTextCol, g_trollStatusMsg);
+						}
+						else
+						{
+							ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 100.0f);
+							ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.0f), "Select a player from the list to view trolling options.");
+						}
+					}
+					ImGui::EndChild();
+					ImGui::PopStyleVar(2);
+					ImGui::PopStyleColor(2);
+				}
+				// =====================================================================
+				// B) If Combat Category Selected: Render Modern 2-Column Options Panel
+				// =====================================================================
+				else if (g_onlineCategory == ONLINE_COMBAT)
+				{
+					float bodyY = oWinPos.y + headerHeight + 8.0f;
+					float bodyH = windowHeight - headerHeight - 16.0f;
+					float totalBodyW = windowWidth - catColWidth - 24.0f;
+					float colGap = 12.0f;
+					float colW = (totalBodyW - colGap) / 2.0f;
+
+					// --- Column 1: Aimbot Options ---
+					float leftColX = oWinPos.x + catColWidth + 8.0f;
+					ImGui::SetCursorScreenPos(ImVec2(leftColX, bodyY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(13, 14, 20, 240));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 14));
+
+					ImGui::BeginChild("CombatAimbotCol", ImVec2(colW, bodyH), true);
+					{
+						ModernSectionHeader("AIMBOT OPTIONS", ICON_FA_CROSSHAIRS);
+
+						static const char* presetItems[] = { "Rage", "Legit", "Semi-Rage", "Custom" };
+						CustomCombo("Presets", "##aimPresets", &g_combatPreset, presetItems, 4);
+
+						ToggleRow("Enable Aimbot", "##aimbotEn", &g_aimbotEnabled, true);
+						ToggleRow("Magic Bullet", "##aimbotMagic", &g_aimbotMagicBullet);
+
+						CustomSliderInt("FOV", "##aimbotFov", &g_aimbotFov, 0, 180);
+						ToggleRow("Draw FOV", "##aimbotDrawFov", &g_aimbotDrawFov, false, true, IM_COL32(245, 248, 255, 255));
+
+						CustomSliderInt("Smoothness", "##aimbotSmooth", &g_aimbotSmoothness, 0, 100);
+						CustomSliderInt("Distance", "##aimbotDist", &g_aimbotDistance, 0, 500, "m");
+						CustomSliderInt("Minimum Health", "##aimbotMinHp", &g_aimbotMinHealth, 0, 100);
+
+						static const char* boneItems[] = { "Head", "Neck", "Chest", "Pelvis" };
+						CustomCombo("Target Bone", "##aimbotBone", &g_aimbotTargetBone, boneItems, 4);
+
+						static const char* priorityItems[] = { "Closest to Crosshair", "Lowest Health", "Distance" };
+						CustomCombo("Target Priority", "##aimbotPrio", &g_aimbotPriority, priorityItems, 3);
+					}
+					ImGui::EndChild();
+					ImGui::PopStyleVar(2);
+					ImGui::PopStyleColor(2);
+
+					// --- Column 2: Silent Aim & Triggerbot Options ---
+					float rightColX = leftColX + colW + colGap;
+					ImGui::SetCursorScreenPos(ImVec2(rightColX, bodyY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(13, 14, 20, 240));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 14));
+
+					ImGui::BeginChild("CombatSilentCol", ImVec2(colW, bodyH), true);
+					{
+						ModernSectionHeader("SILENT AIM OPTIONS", ICON_FA_EYE_SLASH);
+
+						ToggleRow("Enable Silent Aim", "##silentEn", &g_silentAimEnabled, true);
+						ToggleRow("Enable Magic Bullet", "##silentMagic", &g_silentAimMagicBullet);
+
+						CustomSliderInt("Silent Aim FOV", "##silentFov", &g_silentAimFov, 0, 180);
+						ToggleRow("Draw FOV", "##silentDrawFov", &g_silentAimDrawFov, false, true, IM_COL32(245, 248, 255, 255));
+
+						CustomSliderInt("Miss Chance", "##silentMiss", &g_silentAimMissChance, 0, 100, "%");
+						CustomSliderFloat("Distance", "##silentDist", &g_silentAimDistance, 0.0f, 500.0f, "m");
+
+						ToggleRow("Respect Weapon Range", "##silentRange", &g_silentAimWeaponRange);
+
+						static const char* silentBones[] = { "Head", "Neck", "Chest", "Pelvis" };
+						CustomCombo("Target Bone", "##silentBone", &g_silentAimTargetBone, silentBones, 4);
+
+						ToggleRow("Target NPCs", "##silentNpcs", &g_silentAimTargetNPCs);
+						ToggleRow("Prioritize Vehicle Driver", "##silentDriver", &g_silentAimPrioritizeDriver);
+
+						ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+						ModernSectionHeader("TRIGGERBOT OPTIONS", ICON_FA_BOLT);
+
+						ToggleRow("Enable Triggerbot", "##triggerEn", &g_triggerbotEnabled);
+
+						static const char* triggerModes[] = { "On Key Hold", "Always Active", "Smart Crosshair" };
+						CustomCombo("Triggerbot Mode", "##triggerMode", &g_triggerbotMode, triggerModes, 3);
+						CustomSliderInt("Triggerbot Delay", "##triggerDelay", &g_triggerbotDelay, 0, 200, "ms");
+					}
+					ImGui::EndChild();
+					ImGui::PopStyleVar(2);
+					ImGui::PopStyleColor(2);
+				}
+				// =====================================================================
+				// C) If Visuals Category Selected: 2-Column Luxury ESP & Live Canvas
+				// =====================================================================
+				else if (g_onlineCategory == ONLINE_VISUALS)
+				{
+					float bodyY = oWinPos.y + headerHeight + 8.0f;
+					float bodyH = windowHeight - headerHeight - 16.0f;
+					float totalBodyW = windowWidth - catColWidth - 24.0f;
+					float colGap = 12.0f;
+					float colW = (totalBodyW - colGap) / 2.0f;
+
+					// --- Column 1: Player ESP Options ---
+					float leftColX = oWinPos.x + catColWidth + 8.0f;
+					ImGui::SetCursorScreenPos(ImVec2(leftColX, bodyY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(13, 14, 20, 240));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 14));
+
+					ImGui::BeginChild("VisualsCol1", ImVec2(colW, bodyH), true);
+					{
+						ModernSectionHeader("PLAYER ESP OPTIONS", ICON_FA_EYE);
+
+						ToggleRow("Enable Player ESP", "##espEn", &g_espEnabled, true);
+
+						static const char* boxTypes[] = { "Disabled", "2D Bounding Box", "Corner Box", "3D Wireframe Box" };
+						CustomCombo("Bounding Box Type", "##espBoxType", &g_espBoxType, boxTypes, 4);
+
+						ToggleRow("Skeleton ESP", "##espSkel", &g_espSkeleton, true, true, IM_COL32(240, 245, 255, 255));
+						ToggleRow("Snaplines (Tracer)", "##espSnap", &g_espSnaplines, true, true, IM_COL32(200, 220, 255, 255));
+
+						static const char* snapPos[] = { "Top of Screen", "Center Crosshair", "Bottom Center" };
+						CustomCombo("Snapline Origin", "##snapPos", &g_espSnaplinePos, snapPos, 3);
+
+						ToggleRow("Player Name Tag", "##espName", &g_espPlayerName);
+						ToggleRow("Health Bar", "##espHealth", &g_espHealthBar);
+						ToggleRow("Armor Bar", "##espArmor", &g_espArmorBar);
+						ToggleRow("Equipped Weapon", "##espWep", &g_espWeapon);
+						ToggleRow("Distance Indicator", "##espDistTag", &g_espDistance);
+
+						CustomSliderInt("Max Render Distance", "##espDistSlider", &g_espMaxDistance, 50, 1000, "m");
+
+						ToggleRow("Ignore Team / Friends", "##espTeam", &g_espIgnoreTeam);
+						ToggleRow("Visible Only (Occlusion)", "##espVisOnly", &g_espVisibleOnly);
+					}
+					ImGui::EndChild();
+					ImGui::PopStyleVar(2);
+					ImGui::PopStyleColor(2);
+
+					// --- Column 2: Chams, World & Interactive ESP Canvas Preview ---
+					float rightColX = leftColX + colW + colGap;
+					ImGui::SetCursorScreenPos(ImVec2(rightColX, bodyY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(13, 14, 20, 240));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 14));
+
+					ImGui::BeginChild("VisualsCol2", ImVec2(colW, bodyH), true);
+					{
+						ModernSectionHeader("CHAMS & WORLD ESP", ICON_FA_USER_SHIELD);
+
+						ToggleRow("Enable Player Chams", "##chamsEn", &g_chamsEnabled, true, true, IM_COL32(60, 160, 255, 255));
+
+						static const char* chamsMats[] = { "Flat Solid", "Textured Glow", "Wireframe Grid", "Metallic Glass" };
+						CustomCombo("Chams Material", "##chamsMat", &g_chamsMaterial, chamsMats, 4);
+
+						ToggleRow("Through Walls (X-Ray)", "##chamsWall", &g_chamsThroughWalls);
+						ToggleRow("Vehicle 3D ESP (Box & HP)", "##espVeh", &g_espVehicles, true, true, IM_COL32(255, 180, 50, 255));
+						ToggleRow("Dropped Weapons & Items", "##espItems", &g_espDroppedItems, true, true, IM_COL32(200, 240, 255, 255));
+						ToggleRow("NPC / Pedestrian ESP", "##espNpc", &g_espNpc);
+						ToggleRow("Mini-Radar 2D HUD", "##espRadar", &g_espRadar);
+						ToggleRow("Tactical Crosshair", "##espCross", &g_espCrosshair);
+
+						ImGui::Dummy(ImVec2(0.0f, 4.0f));
+						ModernSectionHeader("LIVE 3D ROTATABLE PREVIEW", ICON_FA_DESKTOP);
+
+						// 3D Canvas
+						float previewW = ImGui::GetContentRegionAvail().x;
+						float previewH = 195.0f;
+						ImVec2 canvasMin = ImGui::GetCursorScreenPos();
+						ImVec2 canvasMax = ImVec2(canvasMin.x + previewW, canvasMin.y + previewH);
+						ImDrawList* cDraw = ImGui::GetWindowDrawList();
+
+						// Canvas background
+						cDraw->AddRectFilled(canvasMin, canvasMax, IM_COL32(10, 11, 15, 255), 6.0f);
+						cDraw->AddRect(canvasMin, canvasMax, IM_COL32(30, 33, 44, 255), 6.0f);
+
+						// Invisible interaction button over entire canvas
+						ImGui::SetCursorScreenPos(canvasMin);
+						ImGui::InvisibleButton("##canvas3DDrag", ImVec2(previewW, previewH));
+						bool isDragging = ImGui::IsItemActive();
+						bool isHovered = ImGui::IsItemHovered();
+
+						if (isDragging)
+						{
+							g_previewYaw += ImGui::GetIO().MouseDelta.x * 0.022f;
+						}
+						else if (g_previewAutoRotate)
+						{
+							g_previewYaw += ImGui::GetIO().DeltaTime * 0.70f;
+						}
+
+						if (isHovered && ImGui::GetIO().MouseWheel != 0.0f)
+						{
+							g_previewScale += ImGui::GetIO().MouseWheel * 0.08f;
+							if (g_previewScale < 0.65f) g_previewScale = 0.65f;
+							if (g_previewScale > 1.55f) g_previewScale = 1.55f;
+						}
+
+						// 3D Math Projection Setup
+						float cx = canvasMin.x + previewW * 0.5f;
+						float cy = canvasMin.y + previewH * 0.53f;
+						float cosY = cosf(g_previewYaw);
+						float sinY = sinf(g_previewYaw);
+						float curScale = g_previewScale;
+
+						auto Project3D = [&](float x, float y, float z) -> ImVec2 {
+							float rx = (x * cosY - z * sinY) * curScale;
+							float rz = (x * sinY + z * cosY) * curScale;
+							float ry = y * curScale;
+							float dist = 280.0f;
+							float factor = dist / (dist + rz);
+							return ImVec2(cx + rx * factor, cy + ry * factor);
+						};
+
+						// Floor Pedestal 3D Ring & Crosshairs
+						const int ringSegs = 24;
+						ImVec2 ringPts[ringSegs];
+						for (int i = 0; i < ringSegs; ++i)
+						{
+							float a = ((float)i / ringSegs) * 6.2831853f;
+							ringPts[i] = Project3D(cosf(a) * 36.0f, 68.0f, sinf(a) * 36.0f);
+						}
+						cDraw->AddPolyline(ringPts, ringSegs, IM_COL32(38, 44, 60, 200), true, 1.2f);
+						cDraw->AddLine(Project3D(-36.0f, 68.0f, 0.0f), Project3D(36.0f, 68.0f, 0.0f), IM_COL32(28, 33, 46, 160), 1.0f);
+						cDraw->AddLine(Project3D(0.0f, 68.0f, -36.0f), Project3D(0.0f, 68.0f, 36.0f), IM_COL32(28, 33, 46, 160), 1.0f);
+
+						if (g_espEnabled)
+						{
+							// 3D Bounding Box (8 Vertices)
+							float bw = 22.0f;
+							float bhTop = -72.0f;
+							float bhBot = 66.0f;
+							float bd = 16.0f;
+							ImVec2 box[8] = {
+								Project3D(-bw, bhTop, -bd),
+								Project3D( bw, bhTop, -bd),
+								Project3D( bw, bhTop,  bd),
+								Project3D(-bw, bhTop,  bd),
+								Project3D(-bw, bhBot, -bd),
+								Project3D( bw, bhBot, -bd),
+								Project3D( bw, bhBot,  bd),
+								Project3D(-bw, bhBot,  bd)
+							};
+
+							// Find 2D screen AABB for Box, Health Bar, Weapon, Name
+							ImVec2 bMin = box[0], bMax = box[0];
+							for (int i = 1; i < 8; ++i)
+							{
+								if (box[i].x < bMin.x) bMin.x = box[i].x;
+								if (box[i].y < bMin.y) bMin.y = box[i].y;
+								if (box[i].x > bMax.x) bMax.x = box[i].x;
+								if (box[i].y > bMax.y) bMax.y = box[i].y;
+							}
+
+							// 3D Bones
+							ImVec2 pHead = Project3D(0.0f, -60.0f, 0.0f);
+							ImVec2 pNeck = Project3D(0.0f, -46.0f, 0.0f);
+							ImVec2 pSpine = Project3D(0.0f, -22.0f, 0.0f);
+							ImVec2 pPelvis = Project3D(0.0f, 2.0f, 0.0f);
+
+							ImVec2 pLShoulder = Project3D(-16.0f, -44.0f, 0.0f);
+							ImVec2 pRShoulder = Project3D( 16.0f, -44.0f, 0.0f);
+							ImVec2 pLElbow = Project3D(-20.0f, -20.0f, 4.0f);
+							ImVec2 pRElbow = Project3D( 20.0f, -20.0f, 4.0f);
+							ImVec2 pLHand = Project3D(-16.0f, 2.0f, 10.0f);
+							ImVec2 pRHand = Project3D( 16.0f, 2.0f, 10.0f);
+
+							ImVec2 pLHip = Project3D(-9.0f, 2.0f, 0.0f);
+							ImVec2 pRHip = Project3D( 9.0f, 2.0f, 0.0f);
+							ImVec2 pLKnee = Project3D(-10.0f, 32.0f, 4.0f);
+							ImVec2 pRKnee = Project3D( 10.0f, 32.0f, 4.0f);
+							ImVec2 pLFoot = Project3D(-11.0f, 65.0f, 0.0f);
+							ImVec2 pRFoot = Project3D( 11.0f, 65.0f, 0.0f);
+
+							// 1) Chams
+							if (g_chamsEnabled)
+							{
+								ImU32 chamsCol = IM_COL32((int)(g_chamsVisColor[0] * 255), (int)(g_chamsVisColor[1] * 255), (int)(g_chamsVisColor[2] * 255), 140);
+								float headR = 8.5f * curScale;
+								cDraw->AddCircleFilled(pHead, headR, chamsCol);
+								cDraw->AddQuadFilled(pLShoulder, pRShoulder, pRHip, pLHip, chamsCol);
+								cDraw->AddLine(pLShoulder, pLElbow, chamsCol, 5.0f * curScale);
+								cDraw->AddLine(pLElbow, pLHand, chamsCol, 4.0f * curScale);
+								cDraw->AddLine(pRShoulder, pRElbow, chamsCol, 5.0f * curScale);
+								cDraw->AddLine(pRElbow, pRHand, chamsCol, 4.0f * curScale);
+								cDraw->AddLine(pLHip, pLKnee, chamsCol, 6.0f * curScale);
+								cDraw->AddLine(pLKnee, pLFoot, chamsCol, 5.0f * curScale);
+								cDraw->AddLine(pRHip, pRKnee, chamsCol, 6.0f * curScale);
+								cDraw->AddLine(pRKnee, pRFoot, chamsCol, 5.0f * curScale);
+
+								if (g_chamsMaterial == 2) // Wireframe Grid
+								{
+									cDraw->AddQuad(pLShoulder, pRShoulder, pRHip, pLHip, IM_COL32(255, 255, 255, 180), 1.0f);
+									cDraw->AddCircle(pHead, headR, IM_COL32(255, 255, 255, 180), 12, 1.0f);
+								}
+							}
+
+							// 2) Skeleton
+							if (g_espSkeleton)
+							{
+								ImU32 skelCol = IM_COL32((int)(g_espSkelColor[0] * 255), (int)(g_espSkelColor[1] * 255), (int)(g_espSkelColor[2] * 255), 235);
+								float headR = 8.5f * curScale;
+								cDraw->AddCircle(pHead, headR, skelCol, 16, 1.3f);
+								cDraw->AddLine(pHead, pNeck, skelCol, 1.3f);
+								cDraw->AddLine(pNeck, pSpine, skelCol, 1.3f);
+								cDraw->AddLine(pSpine, pPelvis, skelCol, 1.3f);
+
+								cDraw->AddLine(pNeck, pLShoulder, skelCol, 1.3f);
+								cDraw->AddLine(pLShoulder, pLElbow, skelCol, 1.3f);
+								cDraw->AddLine(pLElbow, pLHand, skelCol, 1.3f);
+
+								cDraw->AddLine(pNeck, pRShoulder, skelCol, 1.3f);
+								cDraw->AddLine(pRShoulder, pRElbow, skelCol, 1.3f);
+								cDraw->AddLine(pRElbow, pRHand, skelCol, 1.3f);
+
+								cDraw->AddLine(pPelvis, pLHip, skelCol, 1.3f);
+								cDraw->AddLine(pLHip, pLKnee, skelCol, 1.3f);
+								cDraw->AddLine(pLKnee, pLFoot, skelCol, 1.3f);
+
+								cDraw->AddLine(pPelvis, pRHip, skelCol, 1.3f);
+								cDraw->AddLine(pRHip, pRKnee, skelCol, 1.3f);
+								cDraw->AddLine(pRKnee, pRFoot, skelCol, 1.3f);
+
+								ImU32 jointCol = IM_COL32(255, 255, 255, 210);
+								cDraw->AddCircleFilled(pNeck, 2.0f, jointCol);
+								cDraw->AddCircleFilled(pLShoulder, 2.0f, jointCol);
+								cDraw->AddCircleFilled(pRShoulder, 2.0f, jointCol);
+								cDraw->AddCircleFilled(pLElbow, 2.0f, jointCol);
+								cDraw->AddCircleFilled(pRElbow, 2.0f, jointCol);
+								cDraw->AddCircleFilled(pLHand, 2.0f, jointCol);
+								cDraw->AddCircleFilled(pRHand, 2.0f, jointCol);
+								cDraw->AddCircleFilled(pLKnee, 2.0f, jointCol);
+								cDraw->AddCircleFilled(pRKnee, 2.0f, jointCol);
+							}
+
+							// 3) Snaplines
+							if (g_espSnaplines)
+							{
+								ImVec2 snapStart = (g_espSnaplinePos == 0) ? ImVec2(cx, canvasMin.y) :
+									((g_espSnaplinePos == 1) ? ImVec2(canvasMin.x + 14.0f, canvasMin.y + 14.0f) : ImVec2(cx, canvasMax.y));
+								cDraw->AddLine(snapStart, pPelvis, IM_COL32((int)(g_espSnapColor[0] * 255), (int)(g_espSnapColor[1] * 255), (int)(g_espSnapColor[2] * 255), 180), 1.0f);
+							}
+
+							// 4) Box ESP
+							ImU32 boxCol = IM_COL32((int)(g_espBoxColor[0] * 255), (int)(g_espBoxColor[1] * 255), (int)(g_espBoxColor[2] * 255), 255);
+							if (g_espBoxType == 1) // 2D Bounding Box
+							{
+								cDraw->AddRect(bMin, bMax, boxCol, 0.0f, 0, 1.5f);
+								cDraw->AddRect(ImVec2(bMin.x - 1, bMin.y - 1), ImVec2(bMax.x + 1, bMax.y + 1), IM_COL32(0, 0, 0, 160), 0.0f, 0, 1.0f);
+							}
+							else if (g_espBoxType == 2) // Corner Box
+							{
+								float cLen = 8.0f * curScale;
+								cDraw->AddLine(ImVec2(bMin.x, bMin.y), ImVec2(bMin.x + cLen, bMin.y), boxCol, 1.5f);
+								cDraw->AddLine(ImVec2(bMin.x, bMin.y), ImVec2(bMin.x, bMin.y + cLen), boxCol, 1.5f);
+								cDraw->AddLine(ImVec2(bMax.x, bMin.y), ImVec2(bMax.x - cLen, bMin.y), boxCol, 1.5f);
+								cDraw->AddLine(ImVec2(bMax.x, bMin.y), ImVec2(bMax.x + cLen, bMin.y), boxCol, 1.5f);
+								cDraw->AddLine(ImVec2(bMin.x, bMax.y), ImVec2(bMin.x + cLen, bMax.y), boxCol, 1.5f);
+								cDraw->AddLine(ImVec2(bMin.x, bMax.y), ImVec2(bMin.x - cLen, bMax.y), boxCol, 1.5f);
+								cDraw->AddLine(ImVec2(bMax.x, bMax.y), ImVec2(bMax.x - cLen, bMax.y), boxCol, 1.5f);
+								cDraw->AddLine(ImVec2(bMax.x, bMax.y), ImVec2(bMax.x - cLen, bMax.y), boxCol, 1.5f);
+							}
+							else if (g_espBoxType == 3) // 3D Box (12 Edges)
+							{
+								// Top Face
+								cDraw->AddLine(box[0], box[1], boxCol, 1.2f);
+								cDraw->AddLine(box[1], box[2], boxCol, 1.2f);
+								cDraw->AddLine(box[2], box[3], boxCol, 1.2f);
+								cDraw->AddLine(box[3], box[0], boxCol, 1.2f);
+								// Bottom Face
+								cDraw->AddLine(box[4], box[5], boxCol, 1.2f);
+								cDraw->AddLine(box[5], box[6], boxCol, 1.2f);
+								cDraw->AddLine(box[6], box[7], boxCol, 1.2f);
+								cDraw->AddLine(box[7], box[4], boxCol, 1.2f);
+								// Pillars
+								cDraw->AddLine(box[0], box[4], boxCol, 1.2f);
+								cDraw->AddLine(box[1], box[5], boxCol, 1.2f);
+								cDraw->AddLine(box[2], box[6], boxCol, 1.2f);
+								cDraw->AddLine(box[3], box[7], boxCol, 1.2f);
+							}
+
+							// 5) Health Bar
+							if (g_espHealthBar)
+							{
+								float barX = bMin.x - 5.0f;
+								cDraw->AddRectFilled(ImVec2(barX - 2.0f, bMin.y), ImVec2(barX, bMax.y), IM_COL32(20, 20, 24, 255));
+								cDraw->AddRectFilled(ImVec2(barX - 2.0f, bMin.y + (bMax.y - bMin.y) * 0.15f), ImVec2(barX, bMax.y), IM_COL32(80, 240, 120, 255));
+							}
+
+							// 6) Armor Bar
+							if (g_espArmorBar)
+							{
+								float barX = bMin.x - 9.0f;
+								cDraw->AddRectFilled(ImVec2(barX - 2.0f, bMin.y), ImVec2(barX, bMax.y), IM_COL32(20, 20, 24, 255));
+								cDraw->AddRectFilled(ImVec2(barX - 2.0f, bMin.y + (bMax.y - bMin.y) * 0.40f), ImVec2(barX, bMax.y), IM_COL32(70, 150, 255, 255));
+							}
+
+							// 7) Player Name Tag
+							if (g_espPlayerName)
+							{
+								ImVec2 nameSz = ImGui::CalcTextSize("Player_01");
+								cDraw->AddText(ImVec2(cx - nameSz.x * 0.5f, bMin.y - 15.0f), IM_COL32(255, 255, 255, 255), "Player_01");
+							}
+
+							// 8) Weapon & Distance
+							if (g_espWeapon)
+							{
+								ImVec2 wepSz = ImGui::CalcTextSize("Carbine Rifle");
+								cDraw->AddText(ImVec2(cx - wepSz.x * 0.5f, bMax.y + 3.0f), IM_COL32(220, 225, 235, 255), "Carbine Rifle");
+							}
+							if (g_espDistance)
+							{
+								float distY = g_espWeapon ? (bMax.y + 16.0f) : (bMax.y + 3.0f);
+								char distBuf[16];
+								sprintf_s(distBuf, "%dm", (int)(g_espMaxDistance * 0.1f));
+								ImVec2 dSz = ImGui::CalcTextSize(distBuf);
+								cDraw->AddText(ImVec2(cx - dSz.x * 0.5f, distY), IM_COL32(130, 135, 150, 255), distBuf);
+							}
+						}
+						else
+						{
+							ImVec2 offSz = ImGui::CalcTextSize("ESP DISABLED (TOGGLE ON TO PREVIEW)");
+							cDraw->AddText(ImVec2(canvasMin.x + (previewW - offSz.x) * 0.5f, canvasMin.y + previewH * 0.5f - 6.0f), IM_COL32(110, 115, 130, 255), "ESP DISABLED (TOGGLE ON TO PREVIEW)");
+						}
+
+						// Badges on Canvas
+						char degBuf[32];
+						sprintf_s(degBuf, "YAW: %d deg", ((int)(fmodf(g_previewYaw * 57.2957f, 360.0f) + 360.0f)) % 360);
+						ImVec2 degSz = ImGui::CalcTextSize(degBuf);
+						cDraw->AddRectFilled(ImVec2(canvasMin.x + 8.0f, canvasMin.y + 8.0f), ImVec2(canvasMin.x + degSz.x + 18.0f, canvasMin.y + 24.0f), IM_COL32(16, 18, 26, 210), 4.0f);
+						cDraw->AddRect(ImVec2(canvasMin.x + 8.0f, canvasMin.y + 8.0f), ImVec2(canvasMin.x + degSz.x + 18.0f, canvasMin.y + 24.0f), IM_COL32(36, 42, 58, 255), 4.0f);
+						cDraw->AddText(ImVec2(canvasMin.x + 13.0f, canvasMin.y + 9.0f), IM_COL32(90, 180, 255, 255), degBuf);
+
+						char zoomBuf[32];
+						sprintf_s(zoomBuf, "ZOOM: %.1fx", g_previewScale);
+						ImVec2 zSz = ImGui::CalcTextSize(zoomBuf);
+						cDraw->AddRectFilled(ImVec2(canvasMax.x - zSz.x - 18.0f, canvasMin.y + 8.0f), ImVec2(canvasMax.x - 8.0f, canvasMin.y + 24.0f), IM_COL32(16, 18, 26, 210), 4.0f);
+						cDraw->AddRect(ImVec2(canvasMax.x - zSz.x - 18.0f, canvasMin.y + 8.0f), ImVec2(canvasMax.x - 8.0f, canvasMin.y + 24.0f), IM_COL32(36, 42, 58, 255), 4.0f);
+						cDraw->AddText(ImVec2(canvasMax.x - zSz.x - 13.0f, canvasMin.y + 9.0f), IM_COL32(180, 190, 210, 255), zoomBuf);
+
+						// Bottom instruction hint
+						ImVec2 hintSz = ImGui::CalcTextSize("Drag mouse to rotate | Wheel to zoom");
+						cDraw->AddText(ImVec2(canvasMin.x + (previewW - hintSz.x) * 0.5f, canvasMax.y - 18.0f), IM_COL32(90, 95, 115, 210), "Drag mouse to rotate | Wheel to zoom");
+
+						// Interactive control buttons below canvas
+						ImGui::Dummy(ImVec2(0.0f, 4.0f));
+						ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+						ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8, 4));
+
+						if (g_previewAutoRotate)
+						{
+							ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(28, 44, 68, 255));
+							ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(38, 56, 88, 255));
+							ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(90, 190, 255, 255));
+							if (ImGui::Button(ICON_FA_SYNC_ALT " Spin ON##spinBtn"))
+								g_previewAutoRotate = false;
+							ImGui::PopStyleColor(3);
+						}
+						else
+						{
+							ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(20, 22, 30, 255));
+							ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(30, 34, 46, 255));
+							ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 145, 160, 255));
+							if (ImGui::Button(ICON_FA_SYNC_ALT " Spin OFF##spinBtn"))
+								g_previewAutoRotate = true;
+							ImGui::PopStyleColor(3);
+						}
+
+						ImGui::SameLine();
+						ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(20, 22, 30, 255));
+						ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(30, 34, 46, 255));
+						ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 205, 220, 255));
+						if (ImGui::Button(ICON_FA_UNDO " Reset 0 deg##resetBtn"))
+						{
+							g_previewYaw = 0.0f;
+							g_previewScale = 1.0f;
+						}
+						ImGui::PopStyleColor(3);
+
+						ImGui::PopStyleVar(2);
+
+						CustomSliderFloat("Zoom Scale", "##previewZoom", &g_previewScale, 0.65f, 1.55f, "x");
+					}
+					ImGui::EndChild();
+					ImGui::PopStyleVar(2);
+					ImGui::PopStyleColor(2);
+				}
+				// =====================================================================
+				// D) If Configs Category Selected: 2-Subpane Profile Manager
+				// =====================================================================
+				else if (g_onlineCategory == ONLINE_CONFIGS)
+				{
+					float bodyY = oWinPos.y + headerHeight + 8.0f;
+					float bodyH = windowHeight - headerHeight - 16.0f;
+					float leftPaneW = 260.0f;
+					float rightPaneW = windowWidth - catColWidth - leftPaneW - 22.0f;
+
+					// --- Sub-Pane 1: Profile List ---
+					ImGui::SetCursorScreenPos(ImVec2(oWinPos.x + catColWidth + 8.0f, bodyY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(13, 14, 20, 240));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 10));
+
+					ImGui::BeginChild("ConfigProfileList", ImVec2(leftPaneW, bodyH), true);
+					{
+						ModernSectionHeader("SAVED CONFIGS", ICON_FA_FOLDER);
+
+						// Search Box
+						ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
+						ImGui::InputTextWithHint("##cfgSearch", "Search profile...", g_configSearch, sizeof(g_configSearch));
+						ImGui::PopItemWidth();
+						ImGui::Spacing();
+
+						// Profiles List
+						for (int i = 0; i < (int)g_configProfiles.size(); i++)
+						{
+							if (g_configSearch[0] != '\0')
+							{
+								std::string needle = g_configSearch;
+								for (auto& c : needle) c = (char)tolower(c);
+								std::string nameStr = g_configProfiles[i].name;
+								for (auto& c : nameStr) c = (char)tolower(c);
+								if (nameStr.find(needle) == std::string::npos) continue;
+							}
+
+							bool isSelected = (g_selectedConfigIdx == i);
+							ImVec2 itemPos = ImGui::GetCursorScreenPos();
+							float itemW = ImGui::GetContentRegionAvail().x;
+							float itemH = 46.0f;
+
+							ImGui::PushID(7000 + i);
+							if (ImGui::InvisibleButton("##cfgItem", ImVec2(itemW, itemH)))
+							{
+								g_selectedConfigIdx = i;
+							}
+							bool isHovered = ImGui::IsItemHovered();
+							ImGui::PopID();
+
+							ImDrawList* cDraw = ImGui::GetWindowDrawList();
+							ImVec2 pMin = itemPos;
+							ImVec2 pMax = ImVec2(itemPos.x + itemW, itemPos.y + itemH);
+
+							ImU32 bgCol = isSelected ? IM_COL32(30, 34, 48, 255) :
+								(isHovered ? IM_COL32(24, 27, 38, 255) : IM_COL32(18, 20, 28, 255));
+							ImU32 borderCol = isSelected ? IM_COL32(80, 90, 125, 255) :
+								(isHovered ? IM_COL32(50, 56, 76, 255) : IM_COL32(30, 33, 44, 255));
+
+							cDraw->AddRectFilled(pMin, pMax, bgCol, 6.0f);
+							cDraw->AddRect(pMin, pMax, borderCol, 6.0f);
+
+							if (isSelected)
+							{
+								cDraw->AddRectFilled(
+									ImVec2(pMin.x, pMin.y + 4.0f),
+									ImVec2(pMin.x + 3.5f, pMax.y - 4.0f),
+									IM_COL32(255, 255, 255, 255),
+									2.0f
+								);
+							}
+
+							// Config Name
+							cDraw->AddText(
+								ImVec2(pMin.x + 12.0f, pMin.y + 6.0f),
+								isSelected ? IM_COL32(255, 255, 255, 255) : IM_COL32(220, 225, 235, 255),
+								g_configProfiles[i].name
+							);
+
+							// Author / Date Tag
+							char metaBuf[64];
+							sprintf_s(metaBuf, "by %s  •  %d vars", g_configProfiles[i].author, g_configProfiles[i].featureCount);
+							cDraw->AddText(
+								ImVec2(pMin.x + 12.0f, pMin.y + 24.0f),
+								IM_COL32(125, 130, 145, 255),
+								metaBuf
+							);
+
+							// Cloud / Local Badge
+							const char* typeBadge = g_configProfiles[i].isCloud ? "CLOUD" : "LOCAL";
+							ImVec2 badgeSz = ImGui::CalcTextSize(typeBadge);
+							cDraw->AddText(
+								ImVec2(pMax.x - badgeSz.x - 10.0f, pMin.y + 6.0f),
+								g_configProfiles[i].isCloud ? IM_COL32(80, 180, 255, 255) : IM_COL32(140, 145, 160, 255),
+								typeBadge
+							);
+
+							ImGui::SetCursorScreenPos(ImVec2(itemPos.x, itemPos.y + itemH + 4.0f));
+						}
+
+						// Bottom Action Buttons
+						ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10.0f);
+						float btnW = (ImGui::GetContentRegionAvail().x - 6.0f) / 2.0f;
+
+						ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(245, 248, 255, 255));
+						ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 225, 240, 255));
+						ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(255, 255, 255, 255));
+						ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(11, 12, 16, 255));
+						if (ImGui::Button("LOAD", ImVec2(btnW, 30.0f)))
+						{
+							if (g_selectedConfigIdx >= 0 && g_selectedConfigIdx < (int)g_configProfiles.size())
+							{
+								sprintf_s(g_configStatusMsg, "[LOADED] '%s' applied to all features successfully!", g_configProfiles[g_selectedConfigIdx].name);
+								g_configStatusTime = (float)ImGui::GetTime();
+							}
+						}
+						ImGui::PopStyleColor(4);
+
+						ImGui::SameLine(0, 6.0f);
+
+						ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(24, 27, 38, 255));
+						ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(36, 40, 56, 255));
+						ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(48, 54, 76, 255));
+						if (ImGui::Button("SAVE ACTIVE", ImVec2(btnW, 30.0f)))
+						{
+							if (g_selectedConfigIdx >= 0 && g_selectedConfigIdx < (int)g_configProfiles.size())
+							{
+								sprintf_s(g_configStatusMsg, "[SAVED] Active settings overwritten to '%s'!", g_configProfiles[g_selectedConfigIdx].name);
+								g_configStatusTime = (float)ImGui::GetTime();
+							}
+						}
+						ImGui::PopStyleColor(3);
+
+						ImGui::Spacing();
+						float fullBtnW = ImGui::GetContentRegionAvail().x;
+						if (ImGui::Button("EXPORT TO CLIPBOARD", ImVec2(fullBtnW, 26.0f)))
+						{
+							sprintf_s(g_configStatusMsg, "[EXPORTED] Profile JSON copied to Windows clipboard!");
+							g_configStatusTime = (float)ImGui::GetTime();
+						}
+					}
+					ImGui::EndChild();
+					ImGui::PopStyleVar(2);
+					ImGui::PopStyleColor(2);
+
+					// --- Sub-Pane 2: Config Details & Creation ---
+					float rightX = oWinPos.x + catColWidth + leftPaneW + 14.0f;
+					ImGui::SetCursorScreenPos(ImVec2(rightX, bodyY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(13, 14, 20, 240));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 14));
+
+					ImGui::BeginChild("ConfigDetailsPane", ImVec2(rightPaneW, bodyH), true);
+					{
+						ModernSectionHeader("PROFILE OVERVIEW", ICON_FA_INFO_CIRCLE);
+
+						if (g_selectedConfigIdx >= 0 && g_selectedConfigIdx < (int)g_configProfiles.size())
+						{
+							ConfigProfile& cfg = g_configProfiles[g_selectedConfigIdx];
+							ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Profile Name: %s", cfg.name);
+							ImGui::TextColored(ImVec4(0.8f, 0.82f, 0.88f, 1.0f), "Creator / Author: %s", cfg.author);
+							ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.80f, 1.0f), "Last Saved Date: %s", cfg.date);
+							ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.80f, 1.0f), "Configured Variables: %d settings", cfg.featureCount);
+							ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "Storage Engine: %s Local AppData Cache", cfg.isCloud ? "Cloud Synced &" : "");
+						}
+
+						ImGui::Dummy(ImVec2(0.0f, 10.0f));
+						ModernSectionHeader("QUICK PRESETS", ICON_FA_BOLT);
+
+						float presetBtnW = (ImGui::GetContentRegionAvail().x - 18.0f) / 4.0f;
+						const char* presetNames[] = { "Legit Mode", "Semi-Rage", "HVH Rage", "ESP Only" };
+						for (int p = 0; p < 4; p++)
+						{
+							if (p > 0) ImGui::SameLine(0, 6.0f);
+							if (ImGui::Button(presetNames[p], ImVec2(presetBtnW, 32.0f)))
+							{
+								sprintf_s(g_configStatusMsg, "[APPLIED] Built-in preset '%s' loaded into active memory!", presetNames[p]);
+								g_configStatusTime = (float)ImGui::GetTime();
+							}
+						}
+
+						ImGui::Dummy(ImVec2(0.0f, 10.0f));
+						ModernSectionHeader("CREATE NEW PROFILE", ICON_FA_PLUS_CIRCLE);
+
+						ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "Enter New Config File Name:");
+						ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
+						ImGui::InputText("##newCfgInput", g_newConfigName, sizeof(g_newConfigName));
+						ImGui::PopItemWidth();
+
+						ImGui::Spacing();
+						if (ImGui::Button("CREATE & SAVE PROFILE", ImVec2(220.0f, 32.0f)))
+						{
+							if (g_newConfigName[0] != '\0')
+							{
+								ConfigProfile newP;
+								strcpy_s(newP.name, g_newConfigName);
+								strcpy_s(newP.author, "User");
+								strcpy_s(newP.date, "2026-09-25");
+								newP.featureCount = 26;
+								newP.isCloud = false;
+								g_configProfiles.push_back(newP);
+								g_selectedConfigIdx = (int)g_configProfiles.size() - 1;
+								sprintf_s(g_configStatusMsg, "[CREATED] Profile '%s' saved successfully!", newP.name);
+								g_configStatusTime = (float)ImGui::GetTime();
+							}
+						}
+
+						// Feedback Notification Bar
+						ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 20.0f);
+						ImVec2 notifMin = ImGui::GetCursorScreenPos();
+						float notifH = 28.0f;
+						float rContentW = ImGui::GetContentRegionAvail().x;
+						ImVec2 notifMax = ImVec2(notifMin.x + rContentW, notifMin.y + notifH);
+						ImDrawList* rDraw = ImGui::GetWindowDrawList();
+
+						float timeSinceCfg = (float)ImGui::GetTime() - g_configStatusTime;
+						bool isRecent = (timeSinceCfg < 4.0f);
+						ImU32 notifBg = isRecent ? IM_COL32(28, 31, 44, 255) : IM_COL32(18, 20, 28, 255);
+						ImU32 notifBorder = isRecent ? IM_COL32(245, 248, 255, 200) : IM_COL32(32, 35, 48, 255);
+						ImU32 notifTextCol = isRecent ? IM_COL32(245, 248, 255, 255) : IM_COL32(130, 135, 150, 255);
+
+						rDraw->AddRectFilled(notifMin, notifMax, notifBg, 5.0f);
+						rDraw->AddRect(notifMin, notifMax, notifBorder, 5.0f);
+						rDraw->AddText(ImVec2(notifMin.x + 8.0f, notifMin.y + 6.0f), notifTextCol, ICON_FA_CHECK_CIRCLE);
+						rDraw->AddText(ImVec2(notifMin.x + 26.0f, notifMin.y + 6.0f), notifTextCol, g_configStatusMsg);
+					}
+					ImGui::EndChild();
+					ImGui::PopStyleVar(2);
+					ImGui::PopStyleColor(2);
+				}
+				// =====================================================================
+				// E) If other category (Favorites, World, Self, etc.) is selected:
+				// =====================================================================
+				else
+				{
+					float listX = oWinPos.x + catColWidth + 18.0f;
+					float listY = oWinPos.y + headerHeight + 14.0f;
+					float totalGridW = windowWidth - catColWidth - 36.0f;
+					float cardGapX = 14.0f;
+					float cardGapY = 10.0f;
+					float cardW = (totalGridW - cardGapX) / 2.0f;
+					float cardH = 50.0f;
+
+					int visibleCardIndex = 0;
+					for (int i = 0; i < g_onlineCardCount; i++)
+					{
+						bool isVisible = (g_onlineCards[i].category == g_onlineCategory);
+
+						if (!isVisible) continue;
+
+						int col = visibleCardIndex % 2;
+						int row = visibleCardIndex / 2;
+						float cardPosX = listX + col * (cardW + cardGapX);
+						float cardPosY = listY + row * (cardH + cardGapY);
+						visibleCardIndex++;
+
+						ImVec2 cMin = ImVec2(cardPosX, cardPosY);
+						ImVec2 cMax = ImVec2(cardPosX + cardW, cardPosY + cardH);
+
+						ImGui::SetCursorScreenPos(cMin);
+						ImGui::PushID(300 + i);
+						bool cardClicked = ImGui::InvisibleButton("##cardbtn", ImVec2(cardW, cardH));
+						bool cardHovered = ImGui::IsItemHovered();
+
+						if (cardClicked)
+						{
+							ImVec2 mousePos = ImGui::GetMousePos();
+							if (mousePos.x < cMin.x + 36.0f)
+							{
+								g_onlineCards[i].bookmarked = !g_onlineCards[i].bookmarked;
+							}
+							else
+							{
+								g_onlineCards[i].enabled = !g_onlineCards[i].enabled;
+							}
+						}
+
+						// Card background (Obsidian Glass)
+						ImU32 cardBg = cardHovered ? IM_COL32(26, 29, 40, 255) : IM_COL32(18, 20, 28, 255);
+						oDrawList->AddRectFilled(cMin, cMax, cardBg, 6.0f);
+						oDrawList->AddRect(cMin, cMax, cardHovered ? IM_COL32(70, 78, 105, 255) : IM_COL32(32, 35, 48, 255), 6.0f);
+
+						// Left Accent Line (Pure White if enabled, muted slate if disabled)
+						ImU32 accentCol = g_onlineCards[i].enabled ? IM_COL32(255, 255, 255, 255) : IM_COL32(45, 50, 65, 255);
+						oDrawList->AddRectFilled(
+							cMin,
+							ImVec2(cMin.x + 3.5f, cMax.y),
+							accentCol,
+							2.0f,
+							ImDrawCornerFlags_Left
+						);
+
+						// Bookmark / Star Icon
+						oDrawList->AddText(
+							ImVec2(cMin.x + 14.0f, cMin.y + 16.0f),
+							g_onlineCards[i].bookmarked ? IM_COL32(255, 255, 255, 240) : IM_COL32(80, 85, 100, 255),
+							g_onlineCards[i].bookmarked ? ICON_FA_STAR : ICON_FA_BOOKMARK
+						);
+
+						// Title
+						oDrawList->AddText(
+							ImVec2(cMin.x + 36.0f, cMin.y + 9.0f),
+							cardHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(230, 232, 240, 255),
+							g_onlineCards[i].title
+						);
+
+						// Subtitle
+						oDrawList->AddText(
+							ImVec2(cMin.x + 36.0f, cMin.y + 27.0f),
+							IM_COL32(125, 130, 145, 255),
+							g_onlineCards[i].desc
+						);
+
+						// Modern Pill Toggle Badge on right
+						float pillW = 44.0f;
+						float pillH = 20.0f;
+						ImVec2 pillMin = ImVec2(cMax.x - pillW - 14.0f, cMin.y + (cardH - pillH) * 0.5f);
+						ImVec2 pillMax = ImVec2(pillMin.x + pillW, pillMin.y + pillH);
+						float pillRadius = pillH * 0.5f;
+
+						if (g_onlineCards[i].enabled)
+						{
+							oDrawList->AddRectFilled(pillMin, pillMax, IM_COL32(245, 248, 255, 255), pillRadius);
+							// Black circle knob on right
+							oDrawList->AddCircleFilled(ImVec2(pillMax.x - pillRadius, pillMin.y + pillRadius), pillRadius - 2.5f, IM_COL32(11, 12, 16, 255));
+							// Crisp label
+							oDrawList->AddText(ImVec2(pillMin.x + 6.0f, pillMin.y + 2.5f), IM_COL32(11, 12, 16, 255), "ON");
+						}
+						else
+						{
+							oDrawList->AddRectFilled(pillMin, pillMax, IM_COL32(20, 22, 30, 255), pillRadius);
+							oDrawList->AddRect(pillMin, pillMax, IM_COL32(40, 44, 58, 255), pillRadius, 15, 1.0f);
+							// Gray circle knob on left
+							oDrawList->AddCircleFilled(ImVec2(pillMin.x + pillRadius, pillMin.y + pillRadius), pillRadius - 2.5f, IM_COL32(130, 135, 150, 255));
+						}
+
+						ImGui::PopID();
+					}
+
+					if (visibleCardIndex == 0)
+					{
+						const char* emptyMsg = "No features available in this category.";
+						ImVec2 msgSize = ImGui::CalcTextSize(emptyMsg);
+						oDrawList->AddText(
+							ImVec2(listX + (totalGridW - msgSize.x) / 2.0f, listY + 120.0f),
+							IM_COL32(110, 110, 125, 255),
+							emptyMsg
+						);
+					}
+				}
+
+				// Render Gear / Keybind / Color picker popup modal if triggered
+				RenderGearSettingsModal();
+
+				ImGui::End();
+				ImGui::PopStyleColor(2);
+				ImGui::PopStyleVar(2);
+			}
+
+			// =========================================================================
+			// 2. RESOURCE DUMPER & EXECUTOR WINDOW (From Screenshot 1)
+			// Appears when 📁 Folder is selected on the top dock!
+			// =========================================================================
+			else if (g_dockMode == DOCK_RESOURCES)
+			{
+				ImGui::SetNextWindowPos(ImVec2(windowStartX, windowStartY), ImGuiCond_Always);
+				ImGui::SetNextWindowSize(ImVec2(windowWidth, windowHeight), ImGuiCond_Always);
+
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+				ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(11, 12, 16, 255));
+				ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+
+				ImGui::Begin("redENGINE_Main", nullptr,
+					ImGuiWindowFlags_NoTitleBar |
+					ImGuiWindowFlags_NoResize |
+					ImGuiWindowFlags_NoScrollbar |
+					ImGuiWindowFlags_NoScrollWithMouse
+				);
+
+				ImDrawList* drawList = ImGui::GetWindowDrawList();
+				ImVec2 windowPos = ImGui::GetWindowPos();
+				ImVec2 windowSize = ImGui::GetWindowSize();
+
+				// Draw completely solid opaque window background
+				drawList->AddRectFilled(
+					windowPos,
+					ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y),
+					IM_COL32(11, 12, 16, 255),
+					10.0f
+				);
+
+				// ==========================================
+				// 0. INTEGRATED MASTER TITLEBAR (42px)
+				// ==========================================
+				float titleBarH = 42.0f;
+				ImVec2 titleBarMin = windowPos;
+				ImVec2 titleBarMax = ImVec2(windowPos.x + windowWidth, windowPos.y + titleBarH);
+
+				// Titlebar solid dark glass background
+				drawList->AddRectFilled(
+					titleBarMin,
+					titleBarMax,
+					IM_COL32(10, 11, 15, 255),
+					10.0f,
+					ImDrawCornerFlags_Top
+				);
+
+				// Bottom hairline divider
+				drawList->AddLine(
+					ImVec2(windowPos.x, windowPos.y + titleBarH),
+					ImVec2(windowPos.x + windowWidth, windowPos.y + titleBarH),
+					IM_COL32(28, 30, 42, 255),
+					1.0f
+				);
+
+				// Window dragging handling (within titlebar, when not clicking interactive elements)
+				ImVec2 mousePos = ImGui::GetMousePos();
+				bool inTitleBar = (mousePos.x >= titleBarMin.x && mousePos.x <= titleBarMax.x &&
+								   mousePos.y >= titleBarMin.y && mousePos.y <= titleBarMax.y);
+				if (inTitleBar && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered())
+				{
+					ReleaseCapture();
+					SendMessage(hWnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+				}
+
+				// Center: 3-Module Segmented Pill Switcher
+				// Tabs: [ Online Menu ]   [ Lua Executor ]   [ Docs ]
+				float segTotalW = 340.0f;
+				float segH = 28.0f;
+				float segX = windowPos.x + (windowWidth - segTotalW) * 0.5f;
+				float segY = windowPos.y + (titleBarH - segH) * 0.5f;
+
+				// Pill background capsule
+				drawList->AddRectFilled(
+					ImVec2(segX, segY),
+					ImVec2(segX + segTotalW, segY + segH),
+					IM_COL32(15, 17, 23, 220),
+					6.0f
+				);
+				drawList->AddRect(
+					ImVec2(segX, segY),
+					ImVec2(segX + segTotalW, segY + segH),
+					IM_COL32(28, 31, 42, 200),
+					6.0f
+				);
+
+				struct ModuleTab {
+					const char* icon;
+					const char* label;
+					int mode;
+				};
+				ModuleTab moduleTabs[] = {
+					{ ICON_FA_GLOBE, "Online Menu", DOCK_ONLINE },
+					{ ICON_FA_CODE,  "Lua Executor", DOCK_RESOURCES },
+					{ ICON_FA_BOOK,  "Docs", DOCK_DOCS }
+				};
+
+				float tabW = (segTotalW - 8.0f) / 3.0f;
+				for (int m = 0; m < 3; m++)
+				{
+					float tx = segX + 4.0f + m * tabW;
+					float ty = segY + 3.0f;
+					float th = segH - 6.0f;
+					ImVec2 tMin = ImVec2(tx, ty);
+					ImVec2 tMax = ImVec2(tx + tabW, ty + th);
+
+					bool isCur = (g_dockMode == moduleTabs[m].mode);
+
+					ImGui::SetCursorScreenPos(tMin);
+					ImGui::PushID(3500 + m);
+					bool tClicked = ImGui::InvisibleButton("##modTabBtnR", ImVec2(tabW, th));
+					bool tHovered = ImGui::IsItemHovered();
+					ImGui::PopID();
+
+					if (tClicked)
+					{
+						g_dockMode = moduleTabs[m].mode;
+					}
+
+					if (isCur)
+					{
+						drawList->AddRectFilled(tMin, tMax, IM_COL32(32, 36, 50, 255), 4.0f);
+						drawList->AddRect(tMin, tMax, IM_COL32(245, 248, 255, 220), 4.0f, 15, 1.0f);
+					}
+					else if (tHovered)
+					{
+						drawList->AddRectFilled(tMin, tMax, IM_COL32(22, 25, 35, 220), 4.0f);
+					}
+
+					ImU32 tabCol = isCur ? IM_COL32(255, 255, 255, 255) :
+						(tHovered ? IM_COL32(220, 225, 240, 255) : IM_COL32(130, 135, 150, 255));
+
+					char tabBuf[64];
+					sprintf_s(tabBuf, "%s  %s", moduleTabs[m].icon, moduleTabs[m].label);
+					ImVec2 tSz = ImGui::CalcTextSize(tabBuf);
+					drawList->AddText(
+						ImVec2(tx + (tabW - tSz.x) * 0.5f, ty + (th - tSz.y) * 0.5f),
+						tabCol,
+						tabBuf
+					);
+				}
+
+				// Right Side: Live FiveM Status Pill + Window Controls (Minimize / Close)
+				float rightX = windowPos.x + windowWidth - 14.0f;
+
+				// Close Button (X)
+				float btnH = 26.0f;
+				float btnW = 28.0f;
+				float closeX = rightX - btnW;
+				float ctrlY = windowPos.y + (titleBarH - btnH) * 0.5f;
+
+				ImGui::SetCursorScreenPos(ImVec2(closeX, ctrlY));
+				ImGui::PushID(3600);
+				bool closeClicked = ImGui::InvisibleButton("##titleCloseR", ImVec2(btnW, btnH));
+				bool closeHovered = ImGui::IsItemHovered();
+				ImGui::PopID();
+
+				if (closeClicked)
+				{
+					PostQuitMessage(0);
+				}
+
+				if (closeHovered)
+				{
+					drawList->AddRectFilled(ImVec2(closeX, ctrlY), ImVec2(closeX + btnW, ctrlY + btnH), IM_COL32(215, 45, 55, 240), 5.0f);
+				}
+				ImVec2 xSz = ImGui::CalcTextSize(ICON_FA_TIMES);
+				drawList->AddText(
+					ImVec2(closeX + (btnW - xSz.x) * 0.5f, ctrlY + (btnH - xSz.y) * 0.5f),
+					closeHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(150, 155, 170, 255),
+					ICON_FA_TIMES
+				);
+
+				// Minimize Button (_)
+				float minX = closeX - btnW - 4.0f;
+				ImGui::SetCursorScreenPos(ImVec2(minX, ctrlY));
+				ImGui::PushID(3601);
+				bool minClicked = ImGui::InvisibleButton("##titleMinR", ImVec2(btnW, btnH));
+				bool minHovered = ImGui::IsItemHovered();
+				ImGui::PopID();
+
+				if (minClicked)
+				{
+					ShowWindow(hWnd, SW_MINIMIZE);
+				}
+
+				if (minHovered)
+				{
+					drawList->AddRectFilled(ImVec2(minX, ctrlY), ImVec2(minX + btnW, ctrlY + btnH), IM_COL32(26, 30, 42, 240), 5.0f);
+				}
+				ImVec2 minSz = ImGui::CalcTextSize(ICON_FA_MINUS);
+				drawList->AddText(
+					ImVec2(minX + (btnW - minSz.x) * 0.5f, ctrlY + (btnH - minSz.y) * 0.5f),
+					minHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(150, 155, 170, 255),
+					ICON_FA_MINUS
+				);
+
+				// ==========================================
+				// 1. LEFT SIDEBAR (Icon Navigation) - 78px
+				// Starts below 42px titlebar, extends to window bottom
+				// ==========================================
+				float sidebarWidth = 78.0f;
+				float sidebarStartY = windowPos.y + titleBarH;
+				float sidebarEndY = windowPos.y + windowSize.y;
+
+				drawList->AddRectFilled(
+					ImVec2(windowPos.x, sidebarStartY),
+					ImVec2(windowPos.x + sidebarWidth, sidebarEndY),
+					IM_COL32(8, 9, 12, 255),
+					10.0f,
+					ImDrawCornerFlags_BotLeft
+				);
+
+				// Right divider line for sidebar
+				drawList->AddLine(
+					ImVec2(windowPos.x + sidebarWidth, sidebarStartY),
+					ImVec2(windowPos.x + sidebarWidth, sidebarEndY),
+					IM_COL32(26, 28, 36, 255),
+					1.0f
+				);
+
+				// --- Top Logo Slot (42px) ---
+				float logoSlotSize = 42.0f;
+				float logoX = windowPos.x + (sidebarWidth - logoSlotSize) / 2.0f;
+				float logoY = sidebarStartY + 8.0f;
+
+				drawList->AddRectFilled(
+					ImVec2(logoX, logoY),
+					ImVec2(logoX + logoSlotSize, logoY + logoSlotSize),
+					IM_COL32(18, 17, 21, 255),
+					7.0f
+				);
+				drawList->AddRect(
+					ImVec2(logoX, logoY),
+					ImVec2(logoX + logoSlotSize, logoY + logoSlotSize),
+					IM_COL32(230, 230, 240, 220),
+					7.0f,
+					15,
+					1.5f
+				);
+
+				if (logoFrameCount > 0 && currentLogoFrame < (int)logoFrames.size())
+				{
+					drawList->PushClipRect(ImVec2(logoX + 2, logoY + 2), ImVec2(logoX + logoSlotSize - 2, logoY + logoSlotSize - 2), true);
+					drawList->AddImageRounded(
+						(void*)logoFrames[currentLogoFrame],
+						ImVec2(logoX + 2, logoY + 2),
+						ImVec2(logoX + logoSlotSize - 2, logoY + logoSlotSize - 2),
+						ImVec2(0, 0), ImVec2(1, 1),
+						IM_COL32_WHITE,
+						5.0f
+					);
+					drawList->PopClipRect();
+				}
+
+				// --- Sidebar Navigation Icons ---
+				struct NavItem {
+					const char* icon;
+					const char* tooltip;
+					int tabId;
+				};
+
+				static const NavItem navItems[] = {
+					{ ICON_FA_CODE,       "Lua Executor",      TAB_EXECUTOR },
+					{ ICON_FA_FOLDER,     "Resource Dumper",   TAB_RESOURCES },
+					{ ICON_FA_SERVER,     "Server Monitor",    TAB_SERVER },
+					{ ICON_FA_BOOK,       "Documentation",     TAB_DOCS },
+					{ ICON_FA_CROSSHAIRS, "Combat",            TAB_COMBAT },
+					{ ICON_FA_EYE,        "Visuals",           TAB_VISUALS },
+					{ ICON_FA_BRIEFCASE,  "Tools & Dumps",     TAB_TOOLS },
+				};
+				const int navCount = sizeof(navItems) / sizeof(navItems[0]);
+
+				float startY = logoY + logoSlotSize + 8.0f;
+				float itemHeight = 44.0f;
+
+				ImGui::PushFont(g_fontSidebarIcons);
+
+				for (int i = 0; i < navCount; i++)
+				{
+					float itemY = startY + i * itemHeight;
+					bool isSelected = (g_currentTab == navItems[i].tabId);
+
+					ImVec2 cardMin = ImVec2(windowPos.x + 8.0f, itemY);
+					ImVec2 cardMax = ImVec2(windowPos.x + sidebarWidth - 8.0f, itemY + itemHeight - 4.0f);
+
+					ImGui::SetCursorScreenPos(cardMin);
+					ImGui::PushID(i);
+
+					bool clicked = ImGui::InvisibleButton("##navbtn", ImVec2(sidebarWidth - 16.0f, itemHeight - 4.0f));
+					bool isHovered = ImGui::IsItemHovered();
+
+					if (clicked)
+					{
+						g_currentTab = navItems[i].tabId;
+					}
+
+					// Hover background
+					if (isHovered && !isSelected)
+					{
+						drawList->AddRectFilled(
+							cardMin,
+							cardMax,
+							IM_COL32(24, 27, 38, 220),
+							6.0f
+						);
+					}
+
+					// Active Tab Pure White Indicator Bar on Left Edge
+					if (isSelected)
+					{
+						drawList->AddRectFilled(
+							cardMin,
+							cardMax,
+							IM_COL32(28, 32, 45, 255),
+							6.0f
+						);
+						drawList->AddRect(
+							cardMin,
+							cardMax,
+							IM_COL32(245, 248, 255, 220),
+							6.0f,
+							15,
+							1.0f
+						);
+						drawList->AddRectFilled(
+							ImVec2(cardMin.x, cardMin.y + 6.0f),
+							ImVec2(cardMin.x + 3.0f, cardMax.y - 6.0f),
+							IM_COL32(255, 255, 255, 255),
+							2.0f
+						);
+					}
+
+					ImU32 iconCol = isSelected ? IM_COL32(255, 255, 255, 255) :
+						(isHovered ? IM_COL32(240, 240, 245, 255) : IM_COL32(130, 130, 138, 255));
+
+					ImVec2 iconSize = ImGui::CalcTextSize(navItems[i].icon);
+					ImVec2 iconPos = ImVec2(
+						cardMin.x + (cardMax.x - cardMin.x - iconSize.x) * 0.5f,
+						cardMin.y + (cardMax.y - cardMin.y - iconSize.y) * 0.5f
+					);
+
+					drawList->AddText(iconPos, iconCol, navItems[i].icon);
+
+					ImGui::PopID();
+				}
+
+				// --- Bottom Settings Gear Icon ---
+				float settingsY = windowPos.y + windowSize.y - 48.0f;
+				bool isSettingsSelected = (g_currentTab == TAB_SETTINGS);
+
+				ImVec2 setMin = ImVec2(windowPos.x + 8.0f, settingsY);
+				ImVec2 setMax = ImVec2(windowPos.x + sidebarWidth - 8.0f, settingsY + 38.0f);
+
+				ImGui::SetCursorScreenPos(setMin);
+				bool settingsClicked = ImGui::InvisibleButton("##settingsbtn", ImVec2(sidebarWidth - 16.0f, 38.0f));
+				bool settingsHovered = ImGui::IsItemHovered();
+
+				if (settingsClicked)
+				{
+					g_currentTab = TAB_SETTINGS;
+				}
+
+				if (settingsHovered && !isSettingsSelected)
+				{
+					drawList->AddRectFilled(setMin, setMax, IM_COL32(24, 27, 38, 220), 6.0f);
+				}
+
+				if (isSettingsSelected)
+				{
+					drawList->AddRectFilled(setMin, setMax, IM_COL32(28, 32, 45, 255), 6.0f);
+					drawList->AddRect(setMin, setMax, IM_COL32(245, 248, 255, 220), 6.0f, 15, 1.0f);
+					drawList->AddRectFilled(
+						ImVec2(setMin.x, setMin.y + 6.0f),
+						ImVec2(setMin.x + 3.0f, setMax.y - 6.0f),
+						IM_COL32(255, 255, 255, 255),
+						2.0f
+					);
+				}
+
+				ImU32 settingsCol = isSettingsSelected ? IM_COL32(255, 255, 255, 255) :
+					(settingsHovered ? IM_COL32(240, 240, 245, 255) : IM_COL32(130, 130, 138, 255));
+
+				ImVec2 settingsIconSize = ImGui::CalcTextSize(ICON_FA_COG);
+				ImVec2 settingsIconPos = ImVec2(
+					setMin.x + (setMax.x - setMin.x - settingsIconSize.x) * 0.5f,
+					setMin.y + (setMax.y - setMin.y - settingsIconSize.y) * 0.5f
+				);
+				drawList->AddText(settingsIconPos, settingsCol, ICON_FA_COG);
+
+				ImGui::PopFont(); // Return to main font
+
+				// ==========================================
+				// 2. MAIN CONTENT AREA
+				// ==========================================
+				float contentX = windowPos.x + sidebarWidth + 14.0f;
+				float contentY = windowPos.y + titleBarH + 10.0f;
+				float contentWidth = windowSize.x - sidebarWidth - 26.0f;
+				float contentHeight = windowSize.y - titleBarH - 20.0f;
+
+				// ------------------------------------------
+				// TAB 1: RESOURCE DUMPER (Matching Screenshot 1)
+				// ------------------------------------------
+				if (g_currentTab == TAB_RESOURCES)
+				{
+					float resListWidth = 210.0f;
+
+					// --- Left: Resource Browser Tree Box ---
+					ImGui::SetCursorScreenPos(ImVec2(contentX, contentY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(11, 10, 13, 255));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(28, 28, 32, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+
+					float resBoxHeight = contentHeight - 42.0f;
+					ImGui::BeginChild("ResourceBrowser", ImVec2(resListWidth, resBoxHeight), true);
+
+					// Search input at top
+					ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+					ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(16, 15, 18, 255));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(35, 35, 40, 255));
+
+					ImGui::SetNextItemWidth(resListWidth - 16.0f);
+					ImGui::InputTextWithHint("##ressearch", "Search for a resource", g_searchFilter, sizeof(g_searchFilter));
+
+					ImGui::PopStyleColor(2);
+					ImGui::PopStyleVar();
+
+					ImGui::Separator();
+					ImGui::Spacing();
+
+					// Resource items or clean empty state
+					if (g_resourceList.empty())
+					{
+						ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 35.0f);
+						ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(95, 95, 105, 255));
+						const char* emptyMsg1 = "No resources available";
+						const char* emptyMsg2 = "Click 'Dump' to scan";
+						ImGui::SetCursorPosX((resListWidth - ImGui::CalcTextSize(emptyMsg1).x) / 2.0f);
+						ImGui::Text("%s", emptyMsg1);
+						ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
+						ImGui::SetCursorPosX((resListWidth - ImGui::CalcTextSize(emptyMsg2).x) / 2.0f);
+						ImGui::Text("%s", emptyMsg2);
+						ImGui::PopStyleColor();
+					}
+					else
+					{
+						for (size_t i = 0; i < g_resourceList.size(); i++)
+						{
+							if (g_searchFilter[0] != '\0')
+							{
+								if (g_resourceList[i].find(g_searchFilter) == std::string::npos)
+									continue;
+							}
+
+							bool isResSelected = (g_selectedResource == (int)i);
+							char itemLabel[128];
+							snprintf(itemLabel, sizeof(itemLabel), " %s  %s  %s", ICON_FA_CARET_RIGHT, ICON_FA_FOLDER, g_resourceList[i].c_str());
+
+							if (isResSelected)
+							{
+								ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(255, 255, 255, 30));
+								ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+							}
+							else
+							{
+								ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(24, 24, 28, 120));
+								ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(180, 180, 190, 255));
+							}
+
+							if (ImGui::Selectable(itemLabel, isResSelected, ImGuiSelectableFlags_SpanAllColumns, ImVec2(0, 20)))
+							{
+								g_selectedResource = (int)i;
+							}
+
+							ImGui::PopStyleColor(2);
+						}
+					}
+
+					ImGui::EndChild();
+					ImGui::PopStyleVar();
+					ImGui::PopStyleColor(2);
+
+					// --- Bottom Action Buttons: Dump & Save ---
+					float btnRowY = contentY + resBoxHeight + 8.0f;
+					float halfBtnWidth = (resListWidth - 8.0f) / 2.0f;
+
+					ImGui::SetCursorScreenPos(ImVec2(contentX, btnRowY));
+					if (AnimatedButton("Dump", ImVec2(halfBtnWidth, 30.0f), 0))
+					{
+						// Dump action
+					}
+
+					ImGui::SetCursorScreenPos(ImVec2(contentX + halfBtnWidth + 8.0f, btnRowY));
+					if (AnimatedButton("Save", ImVec2(halfBtnWidth, 30.0f), 1))
+					{
+						// Save action
+					}
+
+					// --- Right: Code Viewer / Editor Area ---
+					float editorX = contentX + resListWidth + 14.0f;
+					float editorWidth = contentWidth - resListWidth - 14.0f;
+					float editorHeight = contentHeight;
+
+					ImGui::SetCursorScreenPos(ImVec2(editorX, contentY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(11, 10, 13, 255));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(28, 28, 32, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+
+					ImGui::BeginChild("CodeViewerChild", ImVec2(editorWidth, editorHeight), true);
+					editor.Render("##luaeditor", ImVec2(editorWidth - 12.0f, editorHeight - 14.0f), false);
+					ImGui::EndChild();
+
+					ImGui::PopStyleVar();
+					ImGui::PopStyleColor(2);
+
+					// Fine white accent line along the bottom of the editor
+					drawList->AddLine(
+						ImVec2(editorX, contentY + editorHeight - 1.0f),
+						ImVec2(editorX + editorWidth, contentY + editorHeight - 1.0f),
+						IM_COL32(255, 255, 255, 200),
+						1.5f
+					);
+				}
+				// ------------------------------------------
+				// TAB 0: LUA EXECUTOR
+				// ------------------------------------------
+				else if (g_currentTab == TAB_EXECUTOR)
+				{
+					// Pump engine console into local view
+					static std::vector<std::string> s_console;
+					std::string s_line;
+					while (red::PopConsoleLine(s_line))
+					{
+						s_console.push_back(s_line);
+						if (s_console.size() > 400)
+							s_console.erase(s_console.begin(), s_console.begin() + 100);
+					}
+
+					float consoleH = 150.0f;
+					float editorHeight = contentHeight - 48.0f - (g_consoleOpen ? (consoleH + 8.0f) : 0.0f);
+
+					ImGui::SetCursorScreenPos(ImVec2(contentX, contentY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(11, 10, 13, 255));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(28, 28, 32, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+
+					ImGui::BeginChild("ExecutorEditorChild", ImVec2(contentWidth, editorHeight), true);
+					editor.Render("##luaeditor", ImVec2(contentWidth - 12.0f, editorHeight - 14.0f), false);
+					ImGui::EndChild();
+
+					ImGui::PopStyleVar();
+					ImGui::PopStyleColor(2);
+
+					// Bottom executor buttons
+					float btnY = contentY + editorHeight + 10.0f;
+					float btnWidth = 100.0f;
+					float btnHeight = 32.0f;
+					float btnSpacing = 8.0f;
+
+					ImGui::SetCursorScreenPos(ImVec2(contentX, btnY));
+					if (AnimatedButton("Execute", ImVec2(btnWidth, btnHeight), 2))
+					{
+						std::string chunk = editor.GetText();
+						if (!chunk.empty())
+							red::EnqueueExecute(chunk);
+					}
+
+					ImGui::SetCursorScreenPos(ImVec2(contentX + (btnWidth + btnSpacing), btnY));
+					if (AnimatedButton("Clear", ImVec2(btnWidth, btnHeight), 3))
+					{
+						editor.SetText("");
+					}
+
+					ImGui::SetCursorScreenPos(ImVec2(contentX + (btnWidth + btnSpacing) * 2, btnY));
+					if (AnimatedButton("Open File", ImVec2(btnWidth, btnHeight), 4))
+					{
+						wchar_t filePath[MAX_PATH] = L"";
+						OPENFILENAMEW ofn = {};
+						ofn.lStructSize = sizeof(ofn);
+						ofn.hwndOwner = g_hwnd;
+						ofn.lpstrFilter = L"Lua Scripts\0*.lua\0All Files\0*.*\0";
+						ofn.lpstrFile = filePath;
+						ofn.nMaxFile = MAX_PATH;
+						ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+						if (GetOpenFileNameW(&ofn))
+						{
+							std::string data;
+							if (red::ReadFileText(filePath, data))
+							{
+								editor.SetText(data);
+								red::ConsoleLog("loaded: " + std::string(filePath, filePath + lstrlenW(filePath)));
+							}
+							else
+								red::ConsoleLog("[error] failed to read file");
+						}
+					}
+
+					ImGui::SetCursorScreenPos(ImVec2(contentX + (btnWidth + btnSpacing) * 3, btnY));
+					if (AnimatedButton("Save As", ImVec2(btnWidth, btnHeight), 6))
+					{
+						wchar_t filePath[MAX_PATH] = L"script.lua";
+						OPENFILENAMEW ofn = {};
+						ofn.lStructSize = sizeof(ofn);
+						ofn.hwndOwner = g_hwnd;
+						ofn.lpstrFilter = L"Lua Scripts\0*.lua\0All Files\0*.*\0";
+						ofn.lpstrFile = filePath;
+						ofn.nMaxFile = MAX_PATH;
+						ofn.lpstrDefExt = L"lua";
+						ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+						if (GetSaveFileNameW(&ofn))
+						{
+							if (red::WriteFileText(filePath, editor.GetText()))
+								red::ConsoleLog("saved: " + std::string(filePath, filePath + lstrlenW(filePath)));
+							else
+								red::ConsoleLog("[error] failed to write file");
+						}
+					}
+
+					ImGui::SetCursorScreenPos(ImVec2(contentX + (btnWidth + btnSpacing) * 4, btnY));
+					if (AnimatedButton("Console", ImVec2(btnWidth, btnHeight), 7))
+					{
+						g_consoleOpen = !g_consoleOpen;
+					}
+
+					// Attach status readout
+					red::EngineStatus st = red::Status();
+					ImU32 stCol = st.attached ? IM_COL32(120, 235, 160, 255) : IM_COL32(235, 130, 130, 255);
+					drawList->AddCircleFilled(ImVec2(contentX + 568.0f, btnY + btnHeight * 0.5f), 4.0f, stCol);
+					drawList->AddText(ImVec2(contentX + 578.0f, btnY + btnHeight * 0.5f - 7.0f), stCol, st.detail);
+
+					// Console output pane
+					if (g_consoleOpen)
+					{
+						float consoleY = btnY + btnHeight + 8.0f;
+						ImGui::SetCursorScreenPos(ImVec2(contentX, consoleY));
+						ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(8, 9, 13, 255));
+						ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(28, 28, 32, 255));
+						ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+						ImGui::BeginChild("ExecConsole", ImVec2(contentWidth, consoleH), true);
+
+						bool atBottom = (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f);
+						ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(185, 230, 200, 255));
+						for (const auto& ln : s_console)
+							ImGui::TextWrapped("%s", ln.c_str());
+						ImGui::PopStyleColor();
+						if (atBottom)
+							ImGui::SetScrollHereY(1.0f);
+
+						ImGui::EndChild();
+						ImGui::PopStyleVar();
+						ImGui::PopStyleColor(2);
+					}
+				}
+				// ------------------------------------------
+				// OTHER TABS
+				// ------------------------------------------
+				else
+				{
+					ImGui::SetCursorScreenPos(ImVec2(contentX, contentY));
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(11, 10, 13, 255));
+					ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(28, 28, 32, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+
+					ImGui::BeginChild("CategoryChild", ImVec2(contentWidth, contentHeight), true);
+
+					const char* tabTitle = "Module Overview";
+					if (g_currentTab == TAB_SERVER) tabTitle = "Server Network & Event Monitor";
+					else if (g_currentTab == TAB_DOCS) tabTitle = "FiveM Natives & Script Docs";
+					else if (g_currentTab == TAB_COMBAT) tabTitle = "Combat Assist & Weapon Features";
+					else if (g_currentTab == TAB_VISUALS) tabTitle = "Visuals & ESP Configuration";
+					else if (g_currentTab == TAB_TOOLS) tabTitle = "Tools & Cache Decryption";
+					else if (g_currentTab == TAB_SETTINGS) tabTitle = "redENGINE System Settings";
+
+					ImGui::Spacing();
+					ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+					ImGui::Text("  %s", tabTitle);
+					ImGui::PopStyleColor();
+					ImGui::Separator();
+					ImGui::Spacing();
+
+					ImGui::Text("  Status: Active & Synchronized");
+					ImGui::Text("  Hotkey: [INS] Toggle UI  |  [ESC] Close Preview");
+
+					ImGui::EndChild();
+					ImGui::PopStyleVar();
+					ImGui::PopStyleColor(2);
+				}
+
+				ImGui::End();
+				ImGui::PopStyleColor(2);
+				ImGui::PopStyleVar(2);
+
+			}
+			// =========================================================================
+			// 3. DOCUMENTATION WINDOW (Exact same 830x570 size as Resources)
+			// =========================================================================
+			else if (g_dockMode == DOCK_DOCS)
+			{
+				ImGui::SetNextWindowPos(ImVec2(windowStartX, windowStartY), ImGuiCond_Always);
+				ImGui::SetNextWindowSize(ImVec2(windowWidth, windowHeight), ImGuiCond_Always);
+
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+				ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(11, 12, 16, 255));
+				ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(32, 35, 48, 255));
+
+				ImGui::Begin("DocsWindow", nullptr,
+					ImGuiWindowFlags_NoTitleBar |
+					ImGuiWindowFlags_NoResize |
+					ImGuiWindowFlags_NoScrollbar
+				);
+
+				ImDrawList* dDrawList = ImGui::GetWindowDrawList();
+				ImVec2 dWinPos = ImGui::GetWindowPos();
+
+				// Window dragging
+				if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered())
+				{
+					ReleaseCapture();
+					SendMessage(hWnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+				}
+
+				// Solid background
+				dDrawList->AddRectFilled(
+					dWinPos,
+					ImVec2(dWinPos.x + windowWidth, dWinPos.y + windowHeight),
+					IM_COL32(11, 12, 16, 255),
+					10.0f
+				);
+
+				// --- Header Area ---
+				float headerHeight = 46.0f;
+				float emblemRadius = 13.0f;
+				ImVec2 emblemCenter = ImVec2(dWinPos.x + 28.0f, dWinPos.y + 24.0f);
+				dDrawList->AddCircleFilled(emblemCenter, emblemRadius, IM_COL32(26, 25, 32, 255));
+				dDrawList->AddCircle(emblemCenter, emblemRadius, IM_COL32(240, 240, 245, 200), 16, 1.5f);
+
+				// Dynamic Header Title & Description
+				struct DocNavItem {
+					const char* icon;
+					const char* name;
+					const char* desc;
+				};
+
+				static const DocNavItem docCategories[] = {
+					{ ICON_FA_CODE,         "Natives Reference",     "FiveM & CFX Game Natives" },
+					{ ICON_FA_SERVER,       "Server Events",         "Network Sync & Remote Triggers" },
+					{ ICON_FA_FOLDER,       "CFX Resource APIs",     "Resource Manifest & Runtimes" },
+					{ ICON_FA_MICROCHIP,    "Memory & Offsets",      "Direct Engine Memory Offsets" },
+					{ ICON_FA_TERMINAL,     "Lua Cheat Functions",   "Executor-Level Extended APIs" },
+					{ ICON_FA_SHIELD_ALT,   "Safe Execution Guide",  "Anticheat Bypass & Hook Safety" }
+				};
+				const int docCategoryCount = sizeof(docCategories) / sizeof(docCategories[0]);
+				static int docSelectedCategory = 0;
+
+				const char* dTitle = docCategories[docSelectedCategory].name;
+				dDrawList->AddText(ImVec2(dWinPos.x + 50.0f, dWinPos.y + 15.0f), IM_COL32(245, 245, 250, 255), dTitle);
+				ImVec2 dtSz = ImGui::CalcTextSize(dTitle);
+				char docSub[128];
+				sprintf_s(docSub, "|  %s", docCategories[docSelectedCategory].desc);
+				dDrawList->AddText(ImVec2(dWinPos.x + 56.0f + dtSz.x, dWinPos.y + 16.0f), IM_COL32(120, 120, 130, 255), docSub);
+
+				// Divider under header
+				dDrawList->AddLine(
+					ImVec2(dWinPos.x + 12.0f, dWinPos.y + headerHeight),
+					ImVec2(dWinPos.x + windowWidth - 12.0f, dWinPos.y + headerHeight),
+					IM_COL32(28, 28, 34, 255),
+					1.0f
+				);
+
+				// Left Category Sidebar (Matches Resources Sidebar: 78px width)
+				float docSideW = 78.0f;
+				float dcatStartY = dWinPos.y + headerHeight + 8.0f;
+				float dcatH = 52.0f;
+
+				dDrawList->AddRectFilled(
+					ImVec2(dWinPos.x, dWinPos.y + headerHeight),
+					ImVec2(dWinPos.x + docSideW, dWinPos.y + windowHeight),
+					IM_COL32(11, 10, 13, 255),
+					10.0f,
+					ImDrawCornerFlags_BotLeft
+				);
+				dDrawList->AddLine(
+					ImVec2(dWinPos.x + docSideW, dWinPos.y + headerHeight),
+					ImVec2(dWinPos.x + docSideW, dWinPos.y + windowHeight),
+					IM_COL32(28, 28, 32, 255),
+					1.0f
+				);
+
+				ImGui::PushFont(g_fontSidebarIcons);
+				for (int i = 0; i < docCategoryCount; i++)
+				{
+					float cy = dcatStartY + i * dcatH;
+					bool isSel = (docSelectedCategory == i);
+
+					ImGui::SetCursorScreenPos(ImVec2(dWinPos.x, cy));
+					ImGui::PushID(400 + i);
+
+					if (ImGui::InvisibleButton("##dcat", ImVec2(docSideW, dcatH)))
+					{
+						docSelectedCategory = i;
+					}
+					bool isHovered = ImGui::IsItemHovered();
+
+					// Hover background
+					if (isHovered && !isSel)
+					{
+						dDrawList->AddRectFilled(
+							ImVec2(dWinPos.x + 4.0f, cy + 2.0f),
+							ImVec2(dWinPos.x + docSideW - 4.0f, cy + dcatH - 2.0f),
+							IM_COL32(24, 24, 28, 160),
+							4.0f
+						);
+						ImGui::SetTooltip("%s", docCategories[i].name);
+					}
+
+					// Active Indicator Bar on Left Edge (matching Resources)
+					if (isSel)
+					{
+						dDrawList->AddRectFilled(
+							ImVec2(dWinPos.x + 4.0f, cy + 2.0f),
+							ImVec2(dWinPos.x + docSideW - 4.0f, cy + dcatH - 2.0f),
+							IM_COL32(28, 28, 34, 255),
+							4.0f
+						);
+						dDrawList->AddRectFilled(
+							ImVec2(dWinPos.x, cy + 7.0f),
+							ImVec2(dWinPos.x + 3.5f, cy + dcatH - 7.0f),
+							IM_COL32(255, 255, 255, 255),
+							2.0f
+						);
+					}
+
+					ImU32 col = isSel ? IM_COL32(255, 255, 255, 255) :
+						(isHovered ? IM_COL32(230, 230, 240, 255) : IM_COL32(110, 110, 120, 255));
+
+					ImVec2 isz = ImGui::CalcTextSize(docCategories[i].icon);
+					ImVec2 ipos = ImVec2(
+						dWinPos.x + (docSideW - isz.x) / 2.0f,
+						cy + (dcatH - isz.y) / 2.0f
+					);
+					dDrawList->AddText(ipos, col, docCategories[i].icon);
+
+					ImGui::PopID();
+				}
+				ImGui::PopFont();
+
+				// Right Content Scrollable Area
+				float docContentX = dWinPos.x + docSideW + 14.0f;
+				float docContentY = dWinPos.y + headerHeight + 10.0f;
+				float docContentW = windowWidth - docSideW - 24.0f;
+				float docContentH = windowHeight - headerHeight - 20.0f;
+
+				ImGui::SetCursorScreenPos(ImVec2(docContentX, docContentY));
+				ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(11, 10, 13, 255));
+				ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(28, 28, 32, 255));
+				ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
+
+				ImGui::BeginChild("DocContentChild", ImVec2(docContentW, docContentH), true);
+
+				ImGui::Spacing();
+				ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+				ImGui::Text("  %s", docCategories[docSelectedCategory].name);
+				ImGui::PopStyleColor();
+				ImGui::Separator();
+				ImGui::Spacing();
+
+				// Documentation Native Cards
+				struct DocItem {
+					const char* func;
+					const char* returns;
+					const char* desc;
+					const char* example;
+				};
+
+				static DocItem docItems[] = {
+					{
+						"TriggerServerEvent(eventName, ...args)",
+						"void",
+						"Dispatches a custom networked event to the server. Safe to call inside isolated threads.",
+						"TriggerServerEvent('esx:giveInventoryItem', 'money', 50000)"
+					},
+					{
+						"RegisterNetEvent(eventName, handler)",
+						"void",
+						"Registers a listener for incoming server messages and synchronization packets.",
+						"RegisterNetEvent('admin:teleport', function(x, y, z) SetEntityCoords(PlayerPedId(), x, y, z) end)"
+					},
+					{
+						"GetPlayerPed(playerId)",
+						"Entity (Ped)",
+						"Returns the entity handle for a given player index (-1 for local ped).",
+						"local localPed = PlayerPedId() -- Equivalent to GetPlayerPed(-1)"
+					},
+					{
+						"SetEntityCoords(entity, x, y, z, xAxis, yAxis, zAxis, clearArea)",
+						"void",
+						"Teleports the target entity to the specified 3D vector coordinates immediately.",
+						"SetEntityCoords(PlayerPedId(), 215.4, -810.2, 30.5, false, false, false, true)"
+					},
+					{
+						"GiveWeaponToPed(ped, weaponHash, ammoCount, isHidden, bEquipNow)",
+						"void",
+						"Spawns and equips a weapon into the ped inventory with specified ammunition.",
+						"GiveWeaponToPed(PlayerPedId(), GetHashKey('WEAPON_SPECIALCARBINE'), 999, false, true)"
+					}
+				};
+
+				for (int j = 0; j < 5; j++)
+				{
+					ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(18, 17, 22, 255));
+					ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+					char childId[32];
+					sprintf_s(childId, "docCard_%d", j);
+					ImGui::BeginChild(childId, ImVec2(docContentW - 24.0f, 96.0f), true);
+
+					ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+					ImGui::Text("%s", docItems[j].func);
+					ImGui::PopStyleColor();
+
+					ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 120, 130, 255));
+					ImGui::Text("Returns: %s", docItems[j].returns);
+					ImGui::Text("%s", docItems[j].desc);
+					ImGui::PopStyleColor();
+
+					ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 210, 220, 255));
+					ImGui::Text("Example: %s", docItems[j].example);
+					ImGui::PopStyleColor();
+
+					ImGui::EndChild();
+					ImGui::PopStyleVar();
+					ImGui::PopStyleColor();
+					ImGui::Spacing();
+				}
+
+				ImGui::EndChild();
+				ImGui::PopStyleVar();
+				ImGui::PopStyleColor(2);
+
+				ImGui::End();
+				ImGui::PopStyleColor(2);
+				ImGui::PopStyleVar(2);
+			}
+
+		}
+
+		// Rendering
+		ImGui::Render();
+		const float clear_color_with_alpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+		g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
+		ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+		g_pSwapChain->Present(1, 0);
+	}
+
+	// Cleanup
+	ImGui_ImplDX11_Shutdown();
+	ImGui_ImplWin32_Shutdown();
+	ImGui::DestroyContext();
+
+	CleanupDeviceD3D();
+	DestroyWindow(hWnd);
+	UnregisterClass(wc.lpszClassName, wc.hInstance);
+
+	return 0;
+}
+
+bool CreateDeviceD3D(HWND hWnd)
+{
+	DXGI_SWAP_CHAIN_DESC sd;
+	ZeroMemory(&sd, sizeof(sd));
+	sd.BufferCount = 2;
+	sd.BufferDesc.Width = 0;
+	sd.BufferDesc.Height = 0;
+	sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sd.BufferDesc.RefreshRate.Numerator = 60;
+	sd.BufferDesc.RefreshRate.Denominator = 1;
+	sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sd.OutputWindow = hWnd;
+	sd.SampleDesc.Count = 1;
+	sd.SampleDesc.Quality = 0;
+	sd.Windowed = TRUE;
+	sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+	UINT createDeviceFlags = 0;
+	D3D_FEATURE_LEVEL featureLevel;
+	const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
+	HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+	if (res == DXGI_ERROR_UNSUPPORTED)
+		res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+	if (res != S_OK)
+		return false;
+
+	CreateRenderTarget();
+	return true;
+}
+
+void CleanupRenderTarget()
+{
+	if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+}
+
+void CreateRenderTarget()
+{
+	ID3D11Texture2D* pBackBuffer = nullptr;
+	g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+	if (pBackBuffer)
+	{
+		g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+		pBackBuffer->Release();
+	}
+}
+
+void CleanupDeviceD3D()
+{
+	CleanupRenderTarget();
+	if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
+	if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
+	if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
+}
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+		return true;
+
+	switch (msg)
+	{
+	case WM_SIZE:
+		if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED)
+		{
+			CleanupRenderTarget();
+			g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+			CreateRenderTarget();
+		}
+		return 0;
+	case WM_SYSCOMMAND:
+		if ((wParam & 0xfff0) == SC_KEYMENU)
+			return 0;
+		break;
+	case WM_KEYDOWN:
+		if (wParam == VK_ESCAPE)
+		{
+			PostQuitMessage(0);
+			return 0;
+		}
+		if (wParam == VK_INSERT)
+		{
+			guiVisible = !guiVisible;
+			return 0;
+		}
+		break;
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		return 0;
+	}
+	return DefWindowProc(hWnd, msg, wParam, lParam);
+}
